@@ -226,5 +226,6 @@ export async function sendPhoto(photo: string, caption?: string): Promise<void> 
     });
   } catch (err) {
     console.error("[max] Failed to send photo:", err instanceof Error ? err.message : err);
+    throw err;
   }
 }
