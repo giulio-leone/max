@@ -247,7 +247,7 @@ export function validateMcpServerConfig(serverName: string, serverConfig: unknow
 
 export function createMcpServer(
   serverName: string,
-  serverConfig: MCPServerConfig,
+  serverConfig: unknown,
 ): McpConfigMutationResult {
   const existing = readExistingDocument();
   if (!existing.ok || !existing.document) {
@@ -276,8 +276,9 @@ export function createMcpServer(
     };
   }
 
+  const nextServer = serverConfig as MCPServerConfig;
   const document = cloneDocument(existing.document);
-  document.mcpServers[serverName] = serverConfig;
+  document.mcpServers[serverName] = nextServer;
   const written = writeDocument(document);
   return written.ok
     ? {
@@ -290,7 +291,7 @@ export function createMcpServer(
 
 export function updateMcpServer(
   serverName: string,
-  serverConfig: MCPServerConfig,
+  serverConfig: unknown,
 ): McpConfigMutationResult {
   const existing = readExistingDocument();
   if (!existing.ok || !existing.document) {
@@ -319,8 +320,9 @@ export function updateMcpServer(
     };
   }
 
+  const nextServer = serverConfig as MCPServerConfig;
   const document = cloneDocument(existing.document);
-  document.mcpServers[serverName] = serverConfig;
+  document.mcpServers[serverName] = nextServer;
   const written = writeDocument(document);
   return written.ok
     ? {

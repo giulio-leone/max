@@ -9,6 +9,7 @@ import { config, persistModel } from "../config.js";
 import { getRouterConfig, updateRouterConfig } from "../copilot/router.js";
 import { listAvailableModels } from "../copilot/models.js";
 import { searchMemories } from "../store/db.js";
+import { createMcpServer, readMcpConfig, removeMcpServer, updateMcpServer } from "../copilot/mcp-config.js";
 import { createSkill, listSkills, readSkill, removeSkill, updateSkill } from "../copilot/skills.js";
 import {
   createAgent,
@@ -115,8 +116,17 @@ function toOptionalInt(value: unknown): number | undefined {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
 }
 
+function getRouteParam(req: Request, key: string): string {
+  const value = req.params[key];
+  return Array.isArray(value) ? value[0] : value;
+}
+
 function getSlugParam(req: Request): string {
-  return Array.isArray(req.params.slug) ? req.params.slug[0] : req.params.slug;
+  return getRouteParam(req, "slug");
+}
+
+function getMcpServerNameParam(req: Request): string {
+  return getRouteParam(req, "name");
 }
 
 // Health check
@@ -413,6 +423,104 @@ app.put("/skills/:slug", (req: Request, res: Response) => {
     ok: true,
     message: result.message,
     skill: result.skill,
+  });
+});
+
+app.get("/mcp", (_req: Request, res: Response) => {
+  const result = readMcpConfig();
+  if (!result.ok || !result.document) {
+    res.status(400).json({ error: result.message });
+    return;
+  }
+
+  const servers = Object.entries(result.document.mcpServers)
+    .map(([name, config]) => ({ name, config }))
+    .sort((left, right) => left.name.localeCompare(right.name));
+
+  res.json({
+    configPath: result.configPath,
+    servers,
+  });
+});
+
+app.post("/mcp", (req: Request, res: Response) => {
+  const { name, config: serverConfig } = req.body as {
+    name?: string;
+    config?: unknown;
+  };
+
+  if (!name || typeof name !== "string") {
+    res.status(400).json({ error: "Missing 'name' in request body" });
+    return;
+  }
+  if (!serverConfig || typeof serverConfig !== "object" || Array.isArray(serverConfig)) {
+    res.status(400).json({ error: "Missing object 'config' in request body" });
+    return;
+  }
+
+  const result = createMcpServer(name, serverConfig);
+  if (!result.ok || !result.server) {
+    res.status(400).json({
+      error: result.message,
+      ...(result.errors ? { errors: result.errors } : {}),
+    });
+    return;
+  }
+
+  res.status(201).json({
+    ok: true,
+    message: result.message,
+    configPath: result.configPath,
+    serverName: name,
+    server: result.server,
+  });
+});
+
+app.put("/mcp/:name", (req: Request, res: Response) => {
+  const serverName = getMcpServerNameParam(req);
+  const { config: serverConfig } = req.body as {
+    config?: unknown;
+  };
+
+  if (!serverConfig || typeof serverConfig !== "object" || Array.isArray(serverConfig)) {
+    res.status(400).json({ error: "Missing object 'config' in request body" });
+    return;
+  }
+
+  const result = updateMcpServer(serverName, serverConfig);
+  if (!result.ok || !result.server) {
+    res.status(400).json({
+      error: result.message,
+      ...(result.errors ? { errors: result.errors } : {}),
+    });
+    return;
+  }
+
+  res.json({
+    ok: true,
+    message: result.message,
+    configPath: result.configPath,
+    serverName,
+    server: result.server,
+  });
+});
+
+app.delete("/mcp/:name", (req: Request, res: Response) => {
+  const serverName = getMcpServerNameParam(req);
+  const result = removeMcpServer(serverName);
+  if (!result.ok) {
+    res.status(400).json({
+      error: result.message,
+      ...(result.errors ? { errors: result.errors } : {}),
+    });
+    return;
+  }
+
+  res.json({
+    ok: true,
+    message: result.message,
+    configPath: result.configPath,
+    serverName,
   });
 });
 
