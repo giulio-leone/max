@@ -19,9 +19,29 @@ async function ensureToken(): Promise<string | null> {
   return null;
 }
 
+export function setStoredApiToken(token: string) {
+  cachedToken = token;
+  if (typeof window !== "undefined") {
+    localStorage.setItem("max-api-token", token);
+  }
+}
+
 async function getAuthHeaders(): Promise<HeadersInit> {
   const token = await ensureToken();
   return token ? { Authorization: `Bearer ${token}`, "Content-Type": "application/json" } : { "Content-Type": "application/json" };
+}
+
+async function getApiErrorMessage(res: Response): Promise<string> {
+  try {
+    const data = await res.json() as { error?: string; errors?: string[] };
+    const details = [data.error, ...(Array.isArray(data.errors) ? data.errors : [])].filter(
+      (value): value is string => typeof value === "string" && value.trim().length > 0
+    );
+    if (details.length > 0) return details.join(" ");
+  } catch {
+    // Ignore body parsing issues and fall back to the status-based message.
+  }
+  return `API error: ${res.status}`;
 }
 
 export interface Feature {
@@ -166,6 +186,28 @@ export interface AgentChatState {
   history: AgentChatMessage[];
 }
 
+export type SkillSource = "bundled" | "local" | "global";
+
+export interface SkillSummary {
+  slug: string;
+  name: string;
+  description: string;
+  directory: string;
+  source: SkillSource;
+}
+
+export interface SkillDetail extends SkillSummary {
+  content: string;
+  instructions: string;
+  frontmatter: Record<string, string>;
+}
+
+export interface SkillMutationResponse {
+  ok: boolean;
+  message: string;
+  skill: SkillDetail;
+}
+
 export async function fetchHarnessStatus(dir: string): Promise<HarnessStatus> {
   const res = await fetch(`${API_BASE}/harness?dir=${encodeURIComponent(dir)}`, {
     headers: await getAuthHeaders(),
@@ -209,6 +251,58 @@ export async function fetchCurrentModel(): Promise<{ model: string }> {
   const res = await fetch(`${API_BASE}/model`, { headers: await getAuthHeaders() });
   if (!res.ok) throw new Error(`API error: ${res.status}`);
   return res.json();
+}
+
+export async function fetchSkills(): Promise<SkillSummary[]> {
+  const res = await fetch(`${API_BASE}/skills`, { headers: await getAuthHeaders() });
+  if (!res.ok) throw new Error(await getApiErrorMessage(res));
+  return res.json();
+}
+
+export async function fetchSkill(slug: string): Promise<SkillDetail> {
+  const res = await fetch(`${API_BASE}/skills/${encodeURIComponent(slug)}`, {
+    headers: await getAuthHeaders(),
+  });
+  if (!res.ok) throw new Error(await getApiErrorMessage(res));
+  return res.json();
+}
+
+export async function createSkill(payload: {
+  slug: string;
+  name: string;
+  description: string;
+  instructions: string;
+}) {
+  const res = await fetch(`${API_BASE}/skills`, {
+    method: "POST",
+    headers: await getAuthHeaders(),
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error(await getApiErrorMessage(res));
+  return res.json() as Promise<SkillMutationResponse>;
+}
+
+export async function updateSkill(slug: string, payload: {
+  name?: string;
+  description?: string;
+  instructions?: string;
+}) {
+  const res = await fetch(`${API_BASE}/skills/${encodeURIComponent(slug)}`, {
+    method: "PUT",
+    headers: await getAuthHeaders(),
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error(await getApiErrorMessage(res));
+  return res.json() as Promise<SkillMutationResponse>;
+}
+
+export async function deleteSkill(slug: string) {
+  const res = await fetch(`${API_BASE}/skills/${encodeURIComponent(slug)}`, {
+    method: "DELETE",
+    headers: await getAuthHeaders(),
+  });
+  if (!res.ok) throw new Error(await getApiErrorMessage(res));
+  return res.json() as Promise<{ ok: boolean; message: string }>;
 }
 
 export async function fetchProjects(): Promise<ProjectRecord[]> {
