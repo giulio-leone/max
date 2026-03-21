@@ -8,14 +8,50 @@ import { WorkersPanel } from "@/components/workers-panel";
 import { EventStream } from "@/components/event-stream";
 import { HarnessControls } from "@/components/harness-controls";
 import { useHarnessStatus, useSSE } from "@/hooks/use-harness";
-import { startHarness, continueHarness, fetchWorkers, type Worker } from "@/lib/api";
+import { startHarness, continueHarness, fetchWorkers, fetchRecentHarnessDirs, type Worker } from "@/lib/api";
 
 export default function DashboardPage() {
   const [projectDir, setProjectDir] = useState<string | null>(null);
   const [workers, setWorkers] = useState<Worker[]>([]);
   const [busy, setBusy] = useState(false);
 
-  const { status, loading, refresh } = useHarnessStatus(projectDir);
+  // Auto-load projectDir from URL ?dir= or localStorage
+  useEffect(() => {
+    let cancelled = false;
+    const loadInitialDir = async () => {
+      const params = new URLSearchParams(window.location.search);
+      const urlDir = params.get("dir");
+      if (urlDir) {
+        if (!cancelled) setProjectDir(urlDir);
+        localStorage.setItem("max-harness-dir", urlDir);
+        return;
+      }
+
+      const saved = localStorage.getItem("max-harness-dir");
+      if (saved) {
+        if (!cancelled) setProjectDir(saved);
+        return;
+      }
+
+      try {
+        const recent = await fetchRecentHarnessDirs();
+        const latest = recent[0];
+        if (latest && !cancelled) {
+          setProjectDir(latest);
+          localStorage.setItem("max-harness-dir", latest);
+        }
+      } catch {
+        // ignore bootstrap failures
+      }
+    };
+
+    void loadInitialDir();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const { status, loading, error, refresh } = useHarnessStatus(projectDir);
   const { events, connected, getConnectionId } = useSSE();
 
   // Poll workers
@@ -31,11 +67,19 @@ export default function DashboardPage() {
     return () => clearInterval(id);
   }, []);
 
+  useEffect(() => {
+    if (projectDir) return;
+    const activeHarness = workers.find((worker) => worker.isHarnessWorker && worker.workingDir);
+    if (!activeHarness) return;
+    setProjectDir(activeHarness.workingDir);
+    localStorage.setItem("max-harness-dir", activeHarness.workingDir);
+  }, [workers, projectDir]);
+
   // Refresh harness status when SSE events arrive
   useEffect(() => {
     if (events.length > 0) {
       const last = events[events.length - 1];
-      if (last.type === "harness_started" || last.type === "harness_continued" || last.type === "message") {
+      if (last.type === "harness_started" || last.type === "harness_continued" || last.type === "message" || last.type === "connected") {
         refresh();
       }
     }
@@ -43,6 +87,7 @@ export default function DashboardPage() {
 
   const handleStart = useCallback(async (dir: string, goal: string) => {
     setProjectDir(dir);
+    localStorage.setItem("max-harness-dir", dir);
     setBusy(true);
     try {
       const connId = getConnectionId();
@@ -57,6 +102,7 @@ export default function DashboardPage() {
 
   const handleContinue = useCallback(async (dir: string) => {
     setProjectDir(dir);
+    localStorage.setItem("max-harness-dir", dir);
     setBusy(true);
     try {
       const connId = getConnectionId();
@@ -70,6 +116,9 @@ export default function DashboardPage() {
   }, [getConnectionId]);
 
   const features = status?.features ?? [];
+  const progressEntries = status?.progressLog
+    ? status.progressLog.split("\n").filter((l) => l.trim())
+    : [];
 
   return (
     <div className="p-6 max-w-6xl mx-auto space-y-6">
@@ -90,16 +139,29 @@ export default function DashboardPage() {
         </div>
       </div>
 
+      {/* Error banner */}
+      {error && (
+        <div className="rounded-lg bg-[rgba(239,68,68,0.15)] border border-[var(--danger)] p-3 text-sm text-[var(--danger)]">
+          {error}
+        </div>
+      )}
+
       {/* Controls */}
       <HarnessControls
         phase={status?.phase ?? null}
         onStart={handleStart}
         onContinue={handleContinue}
         disabled={busy}
+        initialDir={projectDir ?? ""}
       />
 
+      {/* Loading state */}
+      {loading && projectDir && (
+        <div className="text-center text-sm text-[var(--text-muted)] animate-pulse">Loading harness status…</div>
+      )}
+
       {/* Progress */}
-      {status && status.phase !== "init" && (
+      {status && (
         <ProgressBar
           percent={status.percentComplete}
           passing={status.passing}
@@ -111,7 +173,7 @@ export default function DashboardPage() {
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         <div className="space-y-6">
           <FeatureList features={features} activeFeatureId={status?.nextFeature?.id} />
-          <ProgressLog entries={status?.progressLog ?? []} />
+          <ProgressLog entries={progressEntries} />
         </div>
         <div className="space-y-6">
           <WorkersPanel workers={workers} />
@@ -123,7 +185,11 @@ export default function DashboardPage() {
       {status && (
         <div className="text-center text-xs text-[var(--text-muted)]">
           Phase: <span className="font-mono text-[var(--accent)]">{status.phase}</span>
-          {" · "}Goal: <span className="font-mono">{status.projectGoal}</span>
+          {status.projectGoal && (
+            <>
+              {" · "}Goal: <span className="font-mono">{status.projectGoal}</span>
+            </>
+          )}
         </div>
       )}
     </div>

@@ -112,6 +112,24 @@ You: "Build me a REST API with auth, CRUD, and rate limiting"
 
 Use `/workers` to see active harness sessions and ask Max to `continue_harness` to resume.
 
+## Control Plane (Dashboard + Live Agent Operations)
+
+Max also exposes a persistent **control plane** through the HTTP API and dashboard (`/control`) so you can manage long-lived agents, tasks, schedules, and heartbeats visually.
+
+For agent automation, the contract is now explicit:
+
+- `defaultPrompt` — the agent's mission/profile and long-lived context
+- `heartbeatPrompt` — the **single one-shot action** to run on each automation tick
+- `heartbeatIntervalSeconds` — the cadence owned by Max
+- `automationEnabled` — pause/resume switch for periodic execution
+
+Important behavior:
+
+- The control plane is the **only scheduler**. If an agent runs every 30 seconds, that cadence lives in `heartbeatIntervalSeconds`, not inside the prompt text.
+- `heartbeatPrompt` must describe **one immediate action only** (for example, `Open Safari now.`), not recurring instructions like `every 30 seconds`.
+- Deleting an agent destroys its managed runtime session and stops future heartbeat-triggered automation for that agent.
+- Run only one live daemon instance per environment. Multiple stale daemons can produce duplicate heartbeat executions and confusing history.
+
 ## Architecture
 
 ```

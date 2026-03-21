@@ -6,6 +6,12 @@ import { getDb, closeDb } from "./store/db.js";
 import { config } from "./config.js";
 import { spawn } from "child_process";
 import { checkForUpdate } from "./update.js";
+import { startControlPlaneScheduler, stopControlPlaneScheduler } from "./control-plane/scheduler.js";
+import {
+  startControlPlaneHeartbeatMonitor,
+  stopControlPlaneHeartbeatMonitor,
+} from "./control-plane/heartbeat-monitor.js";
+import { runControlPlaneLegacyCutoff } from "./control-plane/store.js";
 
 function truncate(text: string, max = 200): string {
   const oneLine = text.replace(/\n/g, " ").trim();
@@ -28,6 +34,21 @@ async function main(): Promise<void> {
   // Initialize SQLite
   getDb();
   console.log("[max] Database initialized");
+  const legacyCutoff = runControlPlaneLegacyCutoff();
+  if (
+    legacyCutoff.normalizedStatuses > 0
+    || legacyCutoff.migratedHeartbeatPrompts > 0
+    || legacyCutoff.disabledLegacyAutomation > 0
+    || legacyCutoff.deletedLegacyMessages > 0
+  ) {
+    console.log(
+      `[max] Control-plane legacy cutoff applied `
+      + `(statuses: ${legacyCutoff.normalizedStatuses}, `
+      + `migrated prompts: ${legacyCutoff.migratedHeartbeatPrompts}, `
+      + `disabled automation: ${legacyCutoff.disabledLegacyAutomation}, `
+      + `deleted legacy messages: ${legacyCutoff.deletedLegacyMessages})`
+    );
+  }
 
   // Start Copilot SDK client
   console.log("[max] Starting Copilot SDK client...");
@@ -52,6 +73,8 @@ async function main(): Promise<void> {
 
   // Start HTTP API for TUI
   await startApiServer();
+  startControlPlaneScheduler();
+  startControlPlaneHeartbeatMonitor();
 
   // Start Telegram bot (if configured)
   if (config.telegramEnabled) {
@@ -117,6 +140,9 @@ async function shutdown(): Promise<void> {
     try { await stopBot(); } catch { /* best effort */ }
   }
 
+  stopControlPlaneScheduler();
+  stopControlPlaneHeartbeatMonitor();
+
   // Destroy all active worker sessions to free memory
   await Promise.allSettled(
     Array.from(workers.values()).map((w) => w.session.destroy())
@@ -143,6 +169,9 @@ export async function restartDaemon(): Promise<void> {
     await sendProactiveMessage("Restarting — back in a sec ⏳").catch(() => {});
     try { await stopBot(); } catch { /* best effort */ }
   }
+
+  stopControlPlaneScheduler();
+  stopControlPlaneHeartbeatMonitor();
 
   // Destroy all active worker sessions to free memory
   await Promise.allSettled(

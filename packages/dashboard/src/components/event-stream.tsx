@@ -35,10 +35,13 @@ export function EventStream({ events }: EventStreamProps) {
               evt.type === "harness_started" || evt.type === "harness_continued" ? "var(--success)" :
               evt.type === "delta" ? "var(--text-muted)" :
               "var(--text)";
+            const summary = evt.content?.slice(0, 200)
+              ?? evt.connectionId
+              ?? JSON.stringify(evt).slice(0, 200);
             return (
               <p key={i} style={{ color }} className="leading-relaxed break-all">
                 <span className="opacity-40">[{evt.type}]</span>{" "}
-                {evt.content?.slice(0, 200) ?? ""}
+                {summary}
               </p>
             );
           })

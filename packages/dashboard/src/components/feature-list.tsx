@@ -37,7 +37,7 @@ export function FeatureList({ features, activeFeatureId }: FeatureListProps) {
                 ) : "⬜"}
               </span>
               <div className="min-w-0 flex-1">
-                <p className="text-sm font-medium truncate">{f.title}</p>
+                <p className="text-sm font-medium truncate">{f.id}</p>
                 <p className="text-xs text-[var(--text-muted)] truncate">{f.description}</p>
               </div>
               <span className="text-xs px-2 py-0.5 rounded-full font-mono flex-shrink-0" style={{

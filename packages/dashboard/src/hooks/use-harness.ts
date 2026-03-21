@@ -33,16 +33,20 @@ export function useHarnessStatus(dir: string | null, pollInterval = 5000) {
 export function useSSE() {
   const [events, setEvents] = useState<SSEEvent[]>([]);
   const [connected, setConnected] = useState(false);
-  const connectionRef = useRef<ReturnType<typeof connectSSE> | null>(null);
+  const connectionRef = useRef<{ close: () => void; getConnectionId: () => string | null } | null>(null);
 
   useEffect(() => {
-    const conn = connectSSE((event) => {
+    let cancelled = false;
+    connectSSE((event) => {
+      if (cancelled) return;
       if (event.connectionId) setConnected(true);
       if (event.type === "error") setConnected(false);
-      setEvents((prev) => [...prev.slice(-100), event]); // keep last 100
+      setEvents((prev) => [...prev.slice(-100), event]);
+    }).then((conn) => {
+      if (cancelled) { conn.close(); return; }
+      connectionRef.current = conn;
     });
-    connectionRef.current = conn;
-    return () => conn.close();
+    return () => { cancelled = true; connectionRef.current?.close(); };
   }, []);
 
   const getConnectionId = useCallback(() => {

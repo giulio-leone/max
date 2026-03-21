@@ -262,6 +262,33 @@ All routes require Bearer token from ~/.max/api-token (except /status).
 | DELETE | `/skills/{slug}` | Remove skill |
 | POST | `/restart` | Restart daemon |
 
+### Control Plane Routes
+
+| Method | Route | Purpose |
+|--------|-------|---------|
+| GET | `/control/overview` | Aggregate counts for projects, tasks, agents, schedules, heartbeats |
+| GET / POST | `/control/projects` | List or create control-plane projects |
+| GET / POST | `/control/tasks` | List or create tasks |
+| GET / POST | `/control/agents` | List or create agents |
+| PATCH / DELETE | `/control/agents/{id}` | Update or delete an agent |
+| GET / POST | `/control/schedules` | List or create schedules |
+| GET | `/control/heartbeats` | Inspect recent heartbeat records |
+| GET / POST | `/control/agents/{id}/chat` | Read or send dedicated agent chat turns |
+| POST | `/control/agents/{id}/heartbeat` | Manual dashboard ping |
+
+### Control-Plane Automation Contract
+
+- `defaultPrompt` = long-lived mission/profile for the agent
+- `heartbeatPrompt` = one immediate action for a single automation tick
+- `heartbeatIntervalSeconds` = cadence owned by Max
+- `automationEnabled` = pause/resume flag for periodic execution
+
+**Rules**:
+- Keep timing in `heartbeatIntervalSeconds`, not in `heartbeatPrompt`
+- `heartbeatPrompt` must not contain recurring instructions like `every 30 seconds`, `while true`, cron, or background loop language
+- Deleting an agent destroys its runtime session and prevents future automation ticks
+- Keep only **one** live daemon instance per environment; stale detached daemons can generate duplicate automation runs
+
 ---
 
 ## Important Notes
@@ -283,6 +310,7 @@ All routes require Bearer token from ~/.max/api-token (except /status).
 - Session resume on crash (context injected)
 - Graceful shutdown (destroy workers, close DB)
 - Force exit after 3s (prevents hangs)
+- Control-plane legacy cutoff runs on daemon start to migrate safe heartbeat prompts and clean old automatic heartbeat chat turns
 
 ---
 
@@ -314,4 +342,3 @@ All routes require Bearer token from ~/.max/api-token (except /status).
 | `src/copilot/router.ts` | 201 | Model selection logic |
 | `src/setup.ts` | 313 | Interactive setup wizard |
 | `src/config.ts` | 90 | Config loading & persistence |
-

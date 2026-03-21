@@ -37,6 +37,18 @@ export default function RootLayout({
                 <span>🤖</span> Workers
               </a>
               <a
+                href="/control"
+                className="flex items-center gap-2 px-3 py-2 rounded-lg text-sm text-[var(--text-muted)] hover:text-[var(--text)] hover:bg-[var(--bg-card-hover)] mt-1"
+              >
+                <span>🧭</span> Control Plane
+              </a>
+              <a
+                href="/chat"
+                className="flex items-center gap-2 px-3 py-2 rounded-lg text-sm text-[var(--text-muted)] hover:text-[var(--text)] hover:bg-[var(--bg-card-hover)] mt-1"
+              >
+                <span>💬</span> Agent Chat
+              </a>
+              <a
                 href="/settings"
                 className="flex items-center gap-2 px-3 py-2 rounded-lg text-sm text-[var(--text-muted)] hover:text-[var(--text)] hover:bg-[var(--bg-card-hover)] mt-1"
               >

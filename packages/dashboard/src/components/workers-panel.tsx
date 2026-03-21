@@ -45,6 +45,7 @@ function WorkerRow({ worker, isHarness }: { worker: Worker; isHarness?: boolean 
       <span className="w-2 h-2 rounded-full flex-shrink-0" style={{ background: statusColor }} />
       <div className="min-w-0 flex-1">
         <p className="text-sm font-mono truncate">{worker.name}</p>
+        <p className="text-xs text-[var(--text-muted)] truncate mt-0.5">{worker.workingDir}</p>
         {worker.lastOutput && (
           <p className="text-xs text-[var(--text-muted)] truncate mt-0.5">{worker.lastOutput}</p>
         )}

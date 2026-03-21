@@ -1,17 +1,23 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 
 interface HarnessControlsProps {
   phase: "init" | "coding" | "complete" | null;
   onStart: (dir: string, goal: string) => void;
   onContinue: (dir: string) => void;
   disabled?: boolean;
+  initialDir?: string;
 }
 
-export function HarnessControls({ phase, onStart, onContinue, disabled }: HarnessControlsProps) {
-  const [dir, setDir] = useState("");
+export function HarnessControls({ phase, onStart, onContinue, disabled, initialDir }: HarnessControlsProps) {
+  const [dir, setDir] = useState(initialDir ?? "");
   const [goal, setGoal] = useState("");
+
+  // Sync with parent-provided dir
+  useEffect(() => {
+    if (initialDir && !dir) setDir(initialDir);
+  }, [initialDir, dir]);
 
   return (
     <div className="rounded-xl bg-[var(--bg-card)] border border-[var(--border)] p-4">

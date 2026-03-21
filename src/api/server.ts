@@ -2,15 +2,40 @@ import express from "express";
 import type { Request, Response, NextFunction } from "express";
 import { readFileSync, writeFileSync, existsSync } from "fs";
 import { randomBytes } from "crypto";
+import { join } from "path";
 import { sendToOrchestrator, getWorkers, cancelCurrentMessage, getLastRouteResult } from "../copilot/orchestrator.js";
 import { sendPhoto } from "../telegram/bot.js";
 import { config, persistModel } from "../config.js";
 import { getRouterConfig, updateRouterConfig } from "../copilot/router.js";
+import { listAvailableModels } from "../copilot/models.js";
 import { searchMemories } from "../store/db.js";
 import { listSkills, removeSkill } from "../copilot/skills.js";
+import {
+  createAgent,
+  deleteAgent,
+  deleteProject,
+  deleteSchedule,
+  deleteTask,
+  createProject,
+  createSchedule,
+  createTask,
+  getControlPlaneOverview,
+  listAgents,
+  listHeartbeats,
+  listProjects,
+  listSchedules,
+  listTasks,
+  pingAgent,
+  setScheduleEnabled,
+  updateAgent,
+  updateProject,
+  updateSchedule,
+  updateTask,
+} from "../control-plane/store.js";
+import { forgetAgentRuntime, getAgentChatState, runScheduleNow, runTaskNow, sendAgentChatMessage } from "../control-plane/runtime.js";
 import { restartDaemon } from "../daemon.js";
-import { API_TOKEN_PATH, ensureMaxHome } from "../paths.js";
-import { getHarnessStatus, readProgress, readFeatureList, HARNESS_DIR } from "../copilot/harness.js";
+import { API_TOKEN_PATH, MAX_HOME, ensureMaxHome } from "../paths.js";
+import { getHarnessStatus, readProgress, readFeatureList } from "../copilot/harness.js";
 
 // Ensure token file exists (generate on first run)
 let apiToken: string | null = null;
@@ -34,46 +59,91 @@ app.use(express.json());
 app.use((_req: Request, res: Response, next: NextFunction) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Headers", "Authorization, Content-Type");
-  res.header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+  res.header("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS");
   if (_req.method === "OPTIONS") { res.sendStatus(204); return; }
   next();
 });
 
 // Bearer token authentication middleware (skip /status health check)
+// Supports both Authorization header and ?token= query param (needed for SSE EventSource)
 app.use((req: Request, res: Response, next: NextFunction) => {
   if (!apiToken || req.path === "/status" || req.path === "/send-photo") return next();
   const auth = req.headers.authorization;
-  if (!auth || auth !== `Bearer ${apiToken}`) {
-    res.status(401).json({ error: "Unauthorized" });
-    return;
-  }
-  next();
+  const queryToken = req.query.token as string | undefined;
+  if (auth === `Bearer ${apiToken}` || queryToken === apiToken) return next();
+  res.status(401).json({ error: "Unauthorized" });
+  return;
 });
 
 // Active SSE connections
 const sseClients = new Map<string, Response>();
 let connectionCounter = 0;
+const HARNESS_DIRS_PATH = join(MAX_HOME, "harness-dirs.json");
+const knownHarnessDirs = loadHarnessDirs();
+
+function loadHarnessDirs(): string[] {
+  try {
+    if (!existsSync(HARNESS_DIRS_PATH)) return [];
+    const raw = JSON.parse(readFileSync(HARNESS_DIRS_PATH, "utf-8")) as unknown;
+    if (!Array.isArray(raw)) return [];
+    return raw
+      .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+      .slice(0, 20);
+  } catch {
+    return [];
+  }
+}
+
+function persistHarnessDirs() {
+  ensureMaxHome();
+  writeFileSync(HARNESS_DIRS_PATH, `${JSON.stringify(knownHarnessDirs, null, 2)}\n`);
+}
+
+function rememberHarnessDir(dir: string | undefined) {
+  const normalized = dir?.trim();
+  if (!normalized) return;
+  const existing = knownHarnessDirs.indexOf(normalized);
+  if (existing >= 0) knownHarnessDirs.splice(existing, 1);
+  knownHarnessDirs.unshift(normalized);
+  if (knownHarnessDirs.length > 20) knownHarnessDirs.length = 20;
+  persistHarnessDirs();
+}
+
+function toOptionalInt(value: unknown): number | undefined {
+  if (typeof value !== "string" || value.trim() === "") return undefined;
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
 
 // Health check
 app.get("/status", (_req: Request, res: Response) => {
+  const workers = Array.from(getWorkers().values());
+  for (const worker of workers) {
+    if (worker.isHarnessWorker) rememberHarnessDir(worker.workingDir);
+  }
   res.json({
     status: "ok",
-    workers: Array.from(getWorkers().values()).map((w) => ({
+    workers: workers.map((w) => ({
       name: w.name,
       workingDir: w.workingDir,
       status: w.status,
+      isHarnessWorker: w.isHarnessWorker,
     })),
   });
 });
 
 // List worker sessions
 app.get("/sessions", (_req: Request, res: Response) => {
-  const workers = Array.from(getWorkers().values()).map((w) => ({
-    name: w.name,
-    workingDir: w.workingDir,
-    status: w.status,
-    lastOutput: w.lastOutput?.slice(0, 500),
-  }));
+  const workers = Array.from(getWorkers().values()).map((w) => {
+    if (w.isHarnessWorker) rememberHarnessDir(w.workingDir);
+    return {
+      name: w.name,
+      workingDir: w.workingDir,
+      status: w.status,
+      lastOutput: w.lastOutput?.slice(0, 500),
+      isHarnessWorker: w.isHarnessWorker,
+    };
+  });
   res.json(workers);
 });
 
@@ -157,6 +227,10 @@ app.post("/cancel", async (_req: Request, res: Response) => {
 });
 
 // Get or switch model
+app.get("/models", async (_req: Request, res: Response) => {
+  res.json(await listAvailableModels());
+});
+
 app.get("/model", (_req: Request, res: Response) => {
   res.json({ model: config.copilotModel });
 });
@@ -265,6 +339,474 @@ app.post("/send-photo", async (req: Request, res: Response) => {
   }
 });
 
+// ── Control Plane API ──────────────────────────────────────────────────────────
+
+app.get("/control/overview", (_req: Request, res: Response) => {
+  res.json(getControlPlaneOverview());
+});
+
+app.get("/control/projects", (_req: Request, res: Response) => {
+  res.json(listProjects());
+});
+
+app.post("/control/projects", (req: Request, res: Response) => {
+  try {
+    const { name, slug, description, workspacePath, status } = req.body as {
+      name?: string;
+      slug?: string;
+      description?: string;
+      workspacePath?: string;
+      status?: string;
+    };
+    if (!name || typeof name !== "string") {
+      res.status(400).json({ error: "Missing 'name' in request body" });
+      return;
+    }
+    res.status(201).json(createProject({ name, slug, description, workspacePath, status }));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(400).json({ error: msg });
+  }
+});
+
+app.patch("/control/projects/:id", (req: Request, res: Response) => {
+  try {
+    const projectId = Number(req.params.id);
+    if (!Number.isInteger(projectId) || projectId <= 0) {
+      res.status(400).json({ error: "Invalid project id" });
+      return;
+    }
+    const { name, description, workspacePath, status } = req.body as {
+      name?: string;
+      description?: string;
+      workspacePath?: string;
+      status?: string;
+    };
+    res.json(updateProject({ id: projectId, name, description, workspacePath, status }));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(400).json({ error: msg });
+  }
+});
+
+app.delete("/control/projects/:id", (req: Request, res: Response) => {
+  try {
+    const projectId = Number(req.params.id);
+    if (!Number.isInteger(projectId) || projectId <= 0) {
+      res.status(400).json({ error: "Invalid project id" });
+      return;
+    }
+    deleteProject(projectId);
+    res.status(204).end();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(400).json({ error: msg });
+  }
+});
+
+app.get("/control/tasks", (req: Request, res: Response) => {
+  const projectId = toOptionalInt(req.query.projectId);
+  res.json(listTasks(projectId));
+});
+
+app.post("/control/tasks", (req: Request, res: Response) => {
+  try {
+    const { projectId, agentId, title, slug, description, prompt, status } = req.body as {
+      projectId?: number;
+      agentId?: number | null;
+      title?: string;
+      slug?: string;
+      description?: string;
+      prompt?: string;
+      status?: string;
+    };
+    if (!projectId || !Number.isInteger(projectId)) {
+      res.status(400).json({ error: "Missing or invalid 'projectId' in request body" });
+      return;
+    }
+    if (!title || typeof title !== "string") {
+      res.status(400).json({ error: "Missing 'title' in request body" });
+      return;
+    }
+    res.status(201).json(createTask({
+      projectId,
+      agentId: typeof agentId === "number" ? agentId : null,
+      title,
+      slug,
+      description,
+      prompt,
+      status,
+    }));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(400).json({ error: msg });
+  }
+});
+
+app.patch("/control/tasks/:id", (req: Request, res: Response) => {
+  try {
+    const taskId = Number(req.params.id);
+    if (!Number.isInteger(taskId) || taskId <= 0) {
+      res.status(400).json({ error: "Invalid task id" });
+      return;
+    }
+    const { projectId, agentId, title, description, prompt, status } = req.body as {
+      projectId?: number;
+      agentId?: number | null;
+      title?: string;
+      description?: string;
+      prompt?: string;
+      status?: string;
+    };
+    res.json(updateTask({
+      id: taskId,
+      projectId: typeof projectId === "number" ? projectId : undefined,
+      agentId: agentId === null || typeof agentId === "number" ? agentId : undefined,
+      title,
+      description,
+      prompt,
+      status,
+    }));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(400).json({ error: msg });
+  }
+});
+
+app.delete("/control/tasks/:id", (req: Request, res: Response) => {
+  try {
+    const taskId = Number(req.params.id);
+    if (!Number.isInteger(taskId) || taskId <= 0) {
+      res.status(400).json({ error: "Invalid task id" });
+      return;
+    }
+    deleteTask(taskId);
+    res.status(204).end();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(400).json({ error: msg });
+  }
+});
+
+app.post("/control/tasks/:id/run", async (req: Request, res: Response) => {
+  try {
+    const taskId = Number(req.params.id);
+    if (!Number.isInteger(taskId) || taskId <= 0) {
+      res.status(400).json({ error: "Invalid task id" });
+      return;
+    }
+    res.json(await runTaskNow(taskId));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(400).json({ error: msg });
+  }
+});
+
+app.get("/control/agents", (req: Request, res: Response) => {
+  const projectId = toOptionalInt(req.query.projectId);
+  res.json(listAgents(projectId));
+});
+
+app.post("/control/agents", (req: Request, res: Response) => {
+  try {
+    const {
+      projectId,
+      name,
+      slug,
+      agentType,
+      workingDir,
+      model,
+      defaultPrompt,
+      heartbeatPrompt,
+      heartbeatIntervalSeconds,
+      automationEnabled,
+      status,
+    } = req.body as {
+      projectId?: number;
+      name?: string;
+      slug?: string;
+      agentType?: string;
+      workingDir?: string;
+      model?: string;
+      defaultPrompt?: string;
+      heartbeatPrompt?: string;
+      heartbeatIntervalSeconds?: number | null;
+      automationEnabled?: boolean;
+      status?: string;
+    };
+    if (!projectId || !Number.isInteger(projectId)) {
+      res.status(400).json({ error: "Missing or invalid 'projectId' in request body" });
+      return;
+    }
+    if (!name || typeof name !== "string") {
+      res.status(400).json({ error: "Missing 'name' in request body" });
+      return;
+    }
+    res.status(201).json(createAgent({
+      projectId,
+      name,
+      slug,
+      agentType: agentType ?? "custom",
+      workingDir,
+      model,
+      defaultPrompt,
+      heartbeatPrompt,
+      heartbeatIntervalSeconds: typeof heartbeatIntervalSeconds === "number" ? heartbeatIntervalSeconds : null,
+      automationEnabled,
+      status,
+    }));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(400).json({ error: msg });
+  }
+});
+
+app.patch("/control/agents/:id", (req: Request, res: Response) => {
+  try {
+    const agentId = Number(req.params.id);
+    if (!Number.isInteger(agentId) || agentId <= 0) {
+      res.status(400).json({ error: "Invalid agent id" });
+      return;
+    }
+    const {
+      projectId,
+      name,
+      agentType,
+      workingDir,
+      model,
+      defaultPrompt,
+      heartbeatPrompt,
+      heartbeatIntervalSeconds,
+      automationEnabled,
+      status,
+    } = req.body as {
+      projectId?: number;
+      name?: string;
+      agentType?: string;
+      workingDir?: string;
+      model?: string;
+      defaultPrompt?: string;
+      heartbeatPrompt?: string;
+      heartbeatIntervalSeconds?: number | null;
+      automationEnabled?: boolean;
+      status?: string;
+    };
+    res.json(updateAgent({
+      id: agentId,
+      projectId: typeof projectId === "number" ? projectId : undefined,
+      name,
+      agentType,
+      workingDir,
+      model,
+      defaultPrompt,
+      heartbeatPrompt,
+      heartbeatIntervalSeconds: heartbeatIntervalSeconds === null || typeof heartbeatIntervalSeconds === "number"
+        ? heartbeatIntervalSeconds
+        : undefined,
+      automationEnabled,
+      status,
+    }));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(400).json({ error: msg });
+  }
+});
+
+app.delete("/control/agents/:id", (req: Request, res: Response) => {
+  try {
+    const agentId = Number(req.params.id);
+    if (!Number.isInteger(agentId) || agentId <= 0) {
+      res.status(400).json({ error: "Invalid agent id" });
+      return;
+    }
+    forgetAgentRuntime(agentId);
+    deleteAgent(agentId);
+    res.status(204).end();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(400).json({ error: msg });
+  }
+});
+
+app.post("/control/agents/:id/heartbeat", (req: Request, res: Response) => {
+  try {
+    const agentId = Number(req.params.id);
+    if (!Number.isInteger(agentId) || agentId <= 0) {
+      res.status(400).json({ error: "Invalid agent id" });
+      return;
+    }
+    const { message } = req.body as { message?: string };
+    res.status(201).json(pingAgent(agentId, message));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(400).json({ error: msg });
+  }
+});
+
+app.get("/control/agents/:id/chat", (req: Request, res: Response) => {
+  try {
+    const agentId = Number(req.params.id);
+    if (!Number.isInteger(agentId) || agentId <= 0) {
+      res.status(400).json({ error: "Invalid agent id" });
+      return;
+    }
+    const limit = toOptionalInt(req.query.limit) ?? 100;
+    res.json(getAgentChatState(agentId, limit));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(400).json({ error: msg });
+  }
+});
+
+app.post("/control/agents/:id/chat", async (req: Request, res: Response) => {
+  try {
+    const agentId = Number(req.params.id);
+    if (!Number.isInteger(agentId) || agentId <= 0) {
+      res.status(400).json({ error: "Invalid agent id" });
+      return;
+    }
+    const { message } = req.body as { message?: string };
+    if (!message || typeof message !== "string") {
+      res.status(400).json({ error: "Missing 'message' in request body" });
+      return;
+    }
+    res.json(await sendAgentChatMessage(agentId, message));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(400).json({ error: msg });
+  }
+});
+
+app.get("/control/schedules", (req: Request, res: Response) => {
+  const projectId = toOptionalInt(req.query.projectId);
+  res.json(listSchedules(projectId));
+});
+
+app.post("/control/schedules", (req: Request, res: Response) => {
+  try {
+    const { projectId, agentId, name, slug, scheduleType, expression, taskPrompt, enabled } = req.body as {
+      projectId?: number;
+      agentId?: number | null;
+      name?: string;
+      slug?: string;
+      scheduleType?: string;
+      expression?: string;
+      taskPrompt?: string;
+      enabled?: boolean;
+    };
+    if (!projectId || !Number.isInteger(projectId)) {
+      res.status(400).json({ error: "Missing or invalid 'projectId' in request body" });
+      return;
+    }
+    if (!name || typeof name !== "string") {
+      res.status(400).json({ error: "Missing 'name' in request body" });
+      return;
+    }
+    if (!expression || typeof expression !== "string") {
+      res.status(400).json({ error: "Missing 'expression' in request body" });
+      return;
+    }
+    res.status(201).json(createSchedule({
+      projectId,
+      agentId: typeof agentId === "number" ? agentId : null,
+      name,
+      slug,
+      scheduleType,
+      expression,
+      taskPrompt,
+      enabled,
+    }));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(400).json({ error: msg });
+  }
+});
+
+app.patch("/control/schedules/:id", (req: Request, res: Response) => {
+  try {
+    const scheduleId = Number(req.params.id);
+    if (!Number.isInteger(scheduleId) || scheduleId <= 0) {
+      res.status(400).json({ error: "Invalid schedule id" });
+      return;
+    }
+    const { projectId, agentId, name, scheduleType, expression, taskPrompt, enabled } = req.body as {
+      projectId?: number;
+      agentId?: number | null;
+      name?: string;
+      scheduleType?: string;
+      expression?: string;
+      taskPrompt?: string;
+      enabled?: boolean;
+    };
+    res.json(updateSchedule({
+      id: scheduleId,
+      projectId: typeof projectId === "number" ? projectId : undefined,
+      agentId: agentId === null || typeof agentId === "number" ? agentId : undefined,
+      name,
+      scheduleType,
+      expression,
+      taskPrompt,
+      enabled,
+    }));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(400).json({ error: msg });
+  }
+});
+
+app.delete("/control/schedules/:id", (req: Request, res: Response) => {
+  try {
+    const scheduleId = Number(req.params.id);
+    if (!Number.isInteger(scheduleId) || scheduleId <= 0) {
+      res.status(400).json({ error: "Invalid schedule id" });
+      return;
+    }
+    deleteSchedule(scheduleId);
+    res.status(204).end();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(400).json({ error: msg });
+  }
+});
+
+app.post("/control/schedules/:id/toggle", (req: Request, res: Response) => {
+  try {
+    const scheduleId = Number(req.params.id);
+    const { enabled } = req.body as { enabled?: boolean };
+    if (!Number.isInteger(scheduleId) || scheduleId <= 0) {
+      res.status(400).json({ error: "Invalid schedule id" });
+      return;
+    }
+    if (typeof enabled !== "boolean") {
+      res.status(400).json({ error: "Missing boolean 'enabled' in request body" });
+      return;
+    }
+    res.json(setScheduleEnabled(scheduleId, enabled));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(400).json({ error: msg });
+  }
+});
+
+app.post("/control/schedules/:id/run", async (req: Request, res: Response) => {
+  try {
+    const scheduleId = Number(req.params.id);
+    if (!Number.isInteger(scheduleId) || scheduleId <= 0) {
+      res.status(400).json({ error: "Invalid schedule id" });
+      return;
+    }
+    res.json(await runScheduleNow(scheduleId));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(400).json({ error: msg });
+  }
+});
+
+app.get("/control/heartbeats", (req: Request, res: Response) => {
+  const rawLimit = toOptionalInt(req.query.limit);
+  res.json(listHeartbeats(rawLimit ?? 50));
+});
+
 // ── Harness API ──────────────────────────────────────────────────────────────
 
 // Get harness status for a project directory
@@ -276,6 +818,7 @@ app.get("/harness", (req: Request, res: Response) => {
   }
 
   try {
+    rememberHarnessDir(dir);
     const status = getHarnessStatus(dir);
     const progress = status.phase !== "init" ? readProgress(dir) : [];
     const featureList = status.phase !== "init" ? readFeatureList(dir) : null;
@@ -284,6 +827,10 @@ app.get("/harness", (req: Request, res: Response) => {
     const msg = err instanceof Error ? err.message : String(err);
     res.status(500).json({ error: msg });
   }
+});
+
+app.get("/harness/recent", (_req: Request, res: Response) => {
+  res.json({ dirs: knownHarnessDirs });
 });
 
 // Start a new harness (delegates to orchestrator via prompt)
@@ -304,6 +851,7 @@ app.post("/harness/start", (req: Request, res: Response) => {
     return;
   }
 
+  rememberHarnessDir(dir);
   sendToOrchestrator(
     `Create a harness worker session in ${dir} with harness mode enabled. The project goal is: ${goal}`,
     { type: "tui", connectionId },
@@ -337,6 +885,7 @@ app.post("/harness/continue", (req: Request, res: Response) => {
     return;
   }
 
+  rememberHarnessDir(dir);
   sendToOrchestrator(
     `Continue the harness in ${dir}. Call continue_harness with working_dir ${dir} to implement the next feature.`,
     { type: "tui", connectionId },
