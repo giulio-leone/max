@@ -3,11 +3,17 @@
 import { type ReactNode, useCallback, useEffect, useMemo, useState } from "react";
 import {
   createSkill,
+  createMcpServer,
   deleteSkill,
+  deleteMcpServer,
   fetchSkill,
   fetchSkills,
+  fetchMcpServers,
   setStoredApiToken,
+  updateMcpServer,
   updateSkill,
+  type McpServerConfigRecord,
+  type McpServerEntry,
   type SkillDetail,
   type SkillSource,
   type SkillSummary,
@@ -21,6 +27,7 @@ const EMPTY_SKILL_FORM = {
 };
 
 type SkillEditorMode = "create" | "edit" | "inspect";
+type McpEditorMode = "create" | "edit";
 
 type AggregatedSkill = {
   slug: string;
@@ -36,6 +43,14 @@ const SOURCE_PRIORITY: Record<SkillSource, number> = {
   global: 1,
   bundled: 2,
 };
+
+function createDefaultMcpJson() {
+  return JSON.stringify({
+    command: "npx",
+    args: ["-y", "example-mcp-server"],
+    tools: ["*"],
+  }, null, 2);
+}
 
 function cardClassName() {
   return "rounded-xl bg-[var(--bg-card)] border border-[var(--border)]";
@@ -67,6 +82,25 @@ function sourceBadgeClassName(source: SkillSource) {
 
 function formatSourceLabel(source: SkillSource) {
   return source.charAt(0).toUpperCase() + source.slice(1);
+}
+
+function formatMcpTransport(config: McpServerConfigRecord) {
+  if (config.type === "http" || config.type === "sse") return config.type.toUpperCase();
+  if (config.type === "stdio") return "STDIO";
+  return "LOCAL";
+}
+
+function describeMcpServer(config: McpServerConfigRecord) {
+  if (typeof config.url === "string" && config.url.trim().length > 0) {
+    return config.url;
+  }
+  if (typeof config.command === "string" && config.command.trim().length > 0) {
+    const args = Array.isArray(config.args)
+      ? config.args.filter((value): value is string => typeof value === "string").slice(0, 2).join(" ")
+      : "";
+    return [config.command, args].filter(Boolean).join(" ");
+  }
+  return "No command or URL configured";
 }
 
 function Field({
@@ -114,6 +148,19 @@ export default function SettingsPage() {
   const [skillsError, setSkillsError] = useState<string | null>(null);
   const [skillNotice, setSkillNotice] = useState<string | null>(null);
 
+  const [mcpConfigPath, setMcpConfigPath] = useState("");
+  const [mcpServers, setMcpServers] = useState<McpServerEntry[]>([]);
+  const [selectedMcpName, setSelectedMcpName] = useState<string | null>(null);
+  const [mcpEditorMode, setMcpEditorMode] = useState<McpEditorMode>("create");
+  const [mcpForm, setMcpForm] = useState({
+    name: "",
+    json: createDefaultMcpJson(),
+  });
+  const [loadingMcp, setLoadingMcp] = useState(true);
+  const [mcpSubmitting, setMcpSubmitting] = useState<"create" | "update" | "delete" | null>(null);
+  const [mcpError, setMcpError] = useState<string | null>(null);
+  const [mcpNotice, setMcpNotice] = useState<string | null>(null);
+
   const syncTokenFromStorage = useCallback(() => {
     if (typeof window === "undefined") return;
     const stored = localStorage.getItem("max-api-token") ?? "";
@@ -142,9 +189,34 @@ export default function SettingsPage() {
     }
   }, [syncTokenFromStorage]);
 
+  const loadMcpServerList = useCallback(async (preferredName?: string | null) => {
+    setLoadingMcp(true);
+    try {
+      const result = await fetchMcpServers();
+      setMcpServers(result.servers);
+      setMcpConfigPath(result.configPath);
+      setMcpError(null);
+      syncTokenFromStorage();
+      setSelectedMcpName((current) => {
+        if (preferredName === null) return null;
+        const target = preferredName ?? current;
+        if (target && result.servers.some((server) => server.name === target)) return target;
+        return result.servers[0]?.name ?? null;
+      });
+    } catch (err) {
+      setMcpError(err instanceof Error ? err.message : "Failed to load MCP servers");
+    } finally {
+      setLoadingMcp(false);
+    }
+  }, [syncTokenFromStorage]);
+
   useEffect(() => {
     void loadSkillsList();
   }, [loadSkillsList]);
+
+  useEffect(() => {
+    void loadMcpServerList();
+  }, [loadMcpServerList]);
 
   useEffect(() => {
     if (!selectedSlug) {
@@ -228,14 +300,40 @@ export default function SettingsPage() {
     () => aggregatedSkills.find((skill) => skill.slug === selectedSlug) ?? null,
     [aggregatedSkills, selectedSlug]
   );
+  const selectedMcpEntry = useMemo(
+    () => mcpServers.find((server) => server.name === selectedMcpName) ?? null,
+    [mcpServers, selectedMcpName]
+  );
 
   const isCreateMode = editorMode === "create";
   const isInspectMode = editorMode === "inspect";
   const isLocalEditable = selectedSkill?.source === "local";
+  const isCreateMcpMode = mcpEditorMode === "create";
+
+  useEffect(() => {
+    if (!selectedMcpName) {
+      setMcpEditorMode("create");
+      setMcpForm({ name: "", json: createDefaultMcpJson() });
+      return;
+    }
+
+    if (!selectedMcpEntry) return;
+
+    setMcpEditorMode("edit");
+    setMcpForm({
+      name: selectedMcpEntry.name,
+      json: JSON.stringify(selectedMcpEntry.config, null, 2),
+    });
+  }, [selectedMcpEntry, selectedMcpName]);
 
   function resetNoticeState() {
     setSkillNotice(null);
     setSkillsError(null);
+  }
+
+  function resetMcpNoticeState() {
+    setMcpNotice(null);
+    setMcpError(null);
   }
 
   function beginCreateSkill(prefill?: Partial<typeof EMPTY_SKILL_FORM>) {
@@ -247,6 +345,17 @@ export default function SettingsPage() {
       ...prefill,
     });
     resetNoticeState();
+  }
+
+  function beginCreateMcpServer(prefill?: Partial<typeof mcpForm>) {
+    setSelectedMcpName(null);
+    setMcpEditorMode("create");
+    setMcpForm({
+      name: "",
+      json: createDefaultMcpJson(),
+      ...prefill,
+    });
+    resetMcpNoticeState();
   }
 
   const handleSaveToken = () => {
@@ -306,6 +415,62 @@ export default function SettingsPage() {
       setSkillsError(err instanceof Error ? err.message : "Failed to delete skill");
     } finally {
       setSubmitting(null);
+    }
+  }
+
+  async function handleMcpSubmit() {
+    const serverName = mcpForm.name.trim();
+    if (!serverName) {
+      setMcpError("Server name is required.");
+      return;
+    }
+
+    let parsedConfig: unknown;
+    try {
+      parsedConfig = JSON.parse(mcpForm.json);
+    } catch (err) {
+      setMcpError(err instanceof Error ? `Invalid MCP config JSON: ${err.message}` : "Invalid MCP config JSON.");
+      return;
+    }
+
+    if (typeof parsedConfig !== "object" || parsedConfig === null || Array.isArray(parsedConfig)) {
+      setMcpError("MCP config JSON must describe an object.");
+      return;
+    }
+
+    const action = isCreateMcpMode ? "create" : "update";
+    setMcpSubmitting(action);
+    resetMcpNoticeState();
+
+    try {
+      const result = isCreateMcpMode
+        ? await createMcpServer({ name: serverName, config: parsedConfig as McpServerConfigRecord })
+        : await updateMcpServer(selectedMcpName ?? serverName, { config: parsedConfig as McpServerConfigRecord });
+
+      setMcpNotice(result.message);
+      await loadMcpServerList(result.serverName);
+    } catch (err) {
+      setMcpError(err instanceof Error ? err.message : "Failed to save MCP server");
+    } finally {
+      setMcpSubmitting(null);
+    }
+  }
+
+  async function handleDeleteMcpServer() {
+    if (!selectedMcpName) return;
+    if (!window.confirm(`Delete MCP server '${selectedMcpName}'?`)) return;
+
+    setMcpSubmitting("delete");
+    resetMcpNoticeState();
+
+    try {
+      const result = await deleteMcpServer(selectedMcpName);
+      setMcpNotice(result.message);
+      await loadMcpServerList();
+    } catch (err) {
+      setMcpError(err instanceof Error ? err.message : "Failed to delete MCP server");
+    } finally {
+      setMcpSubmitting(null);
     }
   }
 
@@ -636,6 +801,183 @@ export default function SettingsPage() {
                 Select a skill from the catalog or create a new local skill to get started.
               </div>
             )}
+          </div>
+        </div>
+      </section>
+
+      <section className={cardClassName()}>
+        <div className="px-4 py-3 border-b border-[var(--border)] flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+          <div>
+            <h3 className="text-sm font-medium text-[var(--text-muted)]">MCP Servers</h3>
+            <p className="text-xs text-[var(--text-muted)] mt-1">
+              Manage the Copilot CLI MCP registry that Max uses when creating or resuming sessions.
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              onClick={() => void loadMcpServerList(selectedMcpName)}
+              className={buttonClassName()}
+              disabled={loadingMcp}
+            >
+              {loadingMcp ? "Refreshing..." : "Refresh"}
+            </button>
+            <button
+              onClick={() => beginCreateMcpServer()}
+              className={buttonClassName("primary")}
+            >
+              New MCP Server
+            </button>
+          </div>
+        </div>
+
+        <div className="px-4 py-3 border-b border-[var(--border)] bg-[rgba(99,102,241,0.06)] text-xs text-[var(--text-muted)]">
+          <p>
+            Config path:{" "}
+            <code className="px-1.5 py-0.5 rounded bg-[var(--bg)] text-[var(--accent)]">
+              {mcpConfigPath || "~/.copilot/mcp-config.json"}
+            </code>
+          </p>
+          <p className="mt-2">
+            Changes are persisted to the Copilot MCP config file. Existing active sessions may need to be recreated or restarted before they pick up updated MCP definitions.
+          </p>
+        </div>
+
+        <div className="grid grid-cols-1 xl:grid-cols-[320px_minmax(0,1fr)]">
+          <aside className="border-b xl:border-b-0 xl:border-r border-[var(--border)] p-4 space-y-3">
+            <div className="flex items-center justify-between gap-2">
+              <p className="text-xs uppercase tracking-wide text-[var(--text-muted)]">Registry</p>
+              <span className="text-xs text-[var(--text-muted)]">{mcpServers.length} servers</span>
+            </div>
+
+            {loadingMcp && mcpServers.length === 0 && (
+              <div className="rounded-lg border border-dashed border-[var(--border)] p-4 text-sm text-[var(--text-muted)]">
+                Loading MCP servers…
+              </div>
+            )}
+
+            {!loadingMcp && mcpServers.length === 0 && (
+              <div className="rounded-lg border border-dashed border-[var(--border)] p-4 text-sm text-[var(--text-muted)]">
+                No MCP servers are configured yet. Create one to start exposing external capabilities to Max.
+              </div>
+            )}
+
+            <div className="space-y-2">
+              {mcpServers.map((server) => {
+                const selected = server.name === selectedMcpName && !isCreateMcpMode;
+                return (
+                  <button
+                    key={server.name}
+                    onClick={() => {
+                      resetMcpNoticeState();
+                      setSelectedMcpName(server.name);
+                    }}
+                    className={`w-full rounded-xl border p-3 text-left transition-colors ${
+                      selected
+                        ? "border-[var(--accent)] bg-[rgba(99,102,241,0.12)]"
+                        : "border-[var(--border)] hover:border-[var(--accent)]"
+                    }`}
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <p className="text-sm font-medium text-[var(--text)] truncate">{server.name}</p>
+                        <p className="text-[11px] text-[var(--text-muted)] mt-1 line-clamp-2">
+                          {describeMcpServer(server.config)}
+                        </p>
+                      </div>
+                      <span className="inline-flex items-center rounded-full border border-[var(--border)] px-2 py-0.5 text-[11px] font-medium text-[var(--text-muted)]">
+                        {formatMcpTransport(server.config)}
+                      </span>
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+          </aside>
+
+          <div className="p-4 md:p-6 space-y-4">
+            {mcpError && (
+              <div className="rounded-lg bg-[rgba(239,68,68,0.15)] border border-[var(--danger)] p-3 text-sm text-[var(--danger)]">
+                {mcpError}
+              </div>
+            )}
+
+            {mcpNotice && (
+              <div className="rounded-lg bg-[rgba(16,185,129,0.15)] border border-[rgba(16,185,129,0.35)] p-3 text-sm text-[#34d399]">
+                {mcpNotice}
+              </div>
+            )}
+
+            <div className="space-y-4">
+              <div>
+                <h4 className="text-lg font-semibold">
+                  {isCreateMcpMode ? "Create MCP Server" : selectedMcpEntry ? `Edit ${selectedMcpEntry.name}` : "MCP Server"}
+                </h4>
+                <p className="text-sm text-[var(--text-muted)] mt-1">
+                  Edit the raw JSON-backed MCP server config so advanced fields are preserved instead of flattened away.
+                </p>
+              </div>
+
+              {!isCreateMcpMode && selectedMcpEntry ? (
+                <div className="rounded-lg border border-[var(--border)] bg-[var(--bg)] px-3 py-2 text-xs text-[var(--text-muted)]">
+                  Renaming is not supported in-place yet. To rename a server, create a new one with the desired name and then delete the old entry.
+                </div>
+              ) : null}
+
+              <div className="grid grid-cols-1 gap-4">
+                <Field label="Server Name" helper={isCreateMcpMode ? "Registry key stored under mcpServers" : "Stable key"}>
+                  <input
+                    value={mcpForm.name}
+                    disabled={!isCreateMcpMode}
+                    onChange={(event) => setMcpForm((current) => ({ ...current, name: event.target.value }))}
+                    placeholder="browser"
+                    className={`${inputClassName()} ${isCreateMcpMode ? "font-mono" : "font-mono opacity-70"}`}
+                  />
+                </Field>
+
+                <Field label="Config JSON" helper="This object is persisted as-is under the selected server name">
+                  <textarea
+                    value={mcpForm.json}
+                    onChange={(event) => setMcpForm((current) => ({ ...current, json: event.target.value }))}
+                    placeholder={createDefaultMcpJson()}
+                    className={textareaClassName()}
+                  />
+                </Field>
+              </div>
+
+              <div className="flex flex-wrap gap-3">
+                <button
+                  onClick={() => void handleMcpSubmit()}
+                  disabled={mcpSubmitting !== null}
+                  className={buttonClassName("primary")}
+                >
+                  {mcpSubmitting === "create"
+                    ? "Creating…"
+                    : mcpSubmitting === "update"
+                      ? "Saving…"
+                      : isCreateMcpMode
+                        ? "Create MCP Server"
+                        : "Save MCP Changes"}
+                </button>
+
+                {!isCreateMcpMode && selectedMcpEntry ? (
+                  <button
+                    onClick={() => void handleDeleteMcpServer()}
+                    disabled={mcpSubmitting !== null}
+                    className={buttonClassName("danger")}
+                  >
+                    {mcpSubmitting === "delete" ? "Deleting…" : "Delete MCP Server"}
+                  </button>
+                ) : null}
+
+                <button
+                  onClick={() => beginCreateMcpServer()}
+                  disabled={mcpSubmitting !== null}
+                  className={buttonClassName()}
+                >
+                  New MCP Server
+                </button>
+              </div>
+            </div>
           </div>
         </div>
       </section>

@@ -208,6 +208,42 @@ export interface SkillMutationResponse {
   skill: SkillDetail;
 }
 
+export interface McpServerConfigRecord {
+  displayName?: string;
+  tools?: string[];
+  type?: string;
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  cwd?: string;
+  url?: string;
+  headers?: Record<string, string>;
+  timeout?: number;
+  source?: string;
+  sourcePath?: string;
+  oauthClientId?: string;
+  oauthPublicClient?: boolean;
+  [key: string]: unknown;
+}
+
+export interface McpServerEntry {
+  name: string;
+  config: McpServerConfigRecord;
+}
+
+export interface McpServerListResponse {
+  configPath: string;
+  servers: McpServerEntry[];
+}
+
+export interface McpServerMutationResponse {
+  ok: boolean;
+  message: string;
+  configPath: string;
+  serverName: string;
+  server?: McpServerConfigRecord;
+}
+
 export async function fetchHarnessStatus(dir: string): Promise<HarnessStatus> {
   const res = await fetch(`${API_BASE}/harness?dir=${encodeURIComponent(dir)}`, {
     headers: await getAuthHeaders(),
@@ -303,6 +339,46 @@ export async function deleteSkill(slug: string) {
   });
   if (!res.ok) throw new Error(await getApiErrorMessage(res));
   return res.json() as Promise<{ ok: boolean; message: string }>;
+}
+
+export async function fetchMcpServers(): Promise<McpServerListResponse> {
+  const res = await fetch(`${API_BASE}/mcp`, { headers: await getAuthHeaders() });
+  if (!res.ok) throw new Error(await getApiErrorMessage(res));
+  return res.json();
+}
+
+export async function createMcpServer(payload: {
+  name: string;
+  config: McpServerConfigRecord;
+}) {
+  const res = await fetch(`${API_BASE}/mcp`, {
+    method: "POST",
+    headers: await getAuthHeaders(),
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error(await getApiErrorMessage(res));
+  return res.json() as Promise<McpServerMutationResponse>;
+}
+
+export async function updateMcpServer(name: string, payload: {
+  config: McpServerConfigRecord;
+}) {
+  const res = await fetch(`${API_BASE}/mcp/${encodeURIComponent(name)}`, {
+    method: "PUT",
+    headers: await getAuthHeaders(),
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error(await getApiErrorMessage(res));
+  return res.json() as Promise<McpServerMutationResponse>;
+}
+
+export async function deleteMcpServer(name: string) {
+  const res = await fetch(`${API_BASE}/mcp/${encodeURIComponent(name)}`, {
+    method: "DELETE",
+    headers: await getAuthHeaders(),
+  });
+  if (!res.ok) throw new Error(await getApiErrorMessage(res));
+  return res.json() as Promise<Omit<McpServerMutationResponse, "server">>;
 }
 
 export async function fetchProjects(): Promise<ProjectRecord[]> {
