@@ -95,6 +95,23 @@ You can talk to Max from:
 - **Telegram** — remote access from your phone (authenticated by user ID)
 - **TUI** — local terminal client (no auth needed)
 
+## Agent Harness (Long-Running Projects)
+
+For complex projects that span multiple sessions, Max supports an **Anthropic-style two-phase harness**:
+
+1. **Initializer Agent** — decomposes your goal into discrete, testable features and scaffolds a `.max-harness/` directory with `feature_list.json`, `progress.md`, and `init.sh`.
+2. **Coding Agent** — picks up the next failing feature, implements it, tests it, marks it passing, and commits. Repeat until all features pass.
+
+```
+You: "Build me a REST API with auth, CRUD, and rate limiting"
+  └─▸ Harness init → feature_list.json (6 features, all failing)
+       └─▸ Coding agent #1 → implements auth → marks passing → commits
+            └─▸ Coding agent #2 → implements users CRUD → …
+                 └─▸ … until all features pass ✅
+```
+
+Use `/workers` to see active harness sessions and ask Max to `continue_harness` to resume.
+
 ## Architecture
 
 ```
@@ -104,12 +121,13 @@ Telegram ──→ Max Daemon ←── TUI
                 │
       ┌─────────┼─────────┐
    Worker 1  Worker 2  Worker N
+   (regular)  (harness)  (harness)
 ```
 
 - **Daemon** (`max start`) — persistent service running Copilot SDK + Telegram bot + HTTP API
 - **TUI** (`max tui`) — lightweight terminal client connecting to the daemon
 - **Orchestrator** — long-running Copilot session with custom tools for session management
-- **Workers** — child Copilot sessions for specific coding tasks
+- **Workers** — child Copilot sessions for specific coding tasks (regular or harness mode)
 
 ## Development
 
