@@ -9,7 +9,7 @@ import { config, persistModel } from "../config.js";
 import { getRouterConfig, updateRouterConfig } from "../copilot/router.js";
 import { listAvailableModels } from "../copilot/models.js";
 import { searchMemories } from "../store/db.js";
-import { listSkills, removeSkill } from "../copilot/skills.js";
+import { createSkill, listSkills, readSkill, removeSkill, updateSkill } from "../copilot/skills.js";
 import {
   createAgent,
   deleteAgent,
@@ -52,14 +52,14 @@ try {
   process.exit(1);
 }
 
-const app = express();
+export const app = express();
 app.use(express.json());
 
 // CORS for dashboard dev server
 app.use((_req: Request, res: Response, next: NextFunction) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Headers", "Authorization, Content-Type");
-  res.header("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS");
+  res.header("Access-Control-Allow-Methods", "GET, POST, PATCH, PUT, DELETE, OPTIONS");
   if (_req.method === "OPTIONS") { res.sendStatus(204); return; }
   next();
 });
@@ -113,6 +113,10 @@ function toOptionalInt(value: unknown): number | undefined {
   if (typeof value !== "string" || value.trim() === "") return undefined;
   const parsed = Number(value);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+function getSlugParam(req: Request): string {
+  return Array.isArray(req.params.slug) ? req.params.slug[0] : req.params.slug;
 }
 
 // Health check
@@ -300,9 +304,121 @@ app.get("/skills", (_req: Request, res: Response) => {
   res.json(skills);
 });
 
+app.get("/skills/:slug", (req: Request, res: Response) => {
+  const slug = getSlugParam(req);
+  const result = readSkill(slug);
+  if (!result.ok || !result.skill) {
+    res.status(400).json({ error: result.message });
+    return;
+  }
+  res.json(result.skill);
+});
+
+app.post("/skills", (req: Request, res: Response) => {
+  const { slug, name, description, instructions } = req.body as {
+    slug?: string;
+    name?: string;
+    description?: string;
+    instructions?: string;
+  };
+
+  if (!slug || typeof slug !== "string") {
+    res.status(400).json({ error: "Missing 'slug' in request body" });
+    return;
+  }
+  if (!name || typeof name !== "string") {
+    res.status(400).json({ error: "Missing 'name' in request body" });
+    return;
+  }
+  if (!description || typeof description !== "string") {
+    res.status(400).json({ error: "Missing 'description' in request body" });
+    return;
+  }
+  if (!instructions || typeof instructions !== "string") {
+    res.status(400).json({ error: "Missing 'instructions' in request body" });
+    return;
+  }
+
+  const existing = readSkill(slug, "local");
+  if (existing.ok) {
+    res.status(400).json({ error: `Skill '${slug}' already exists in local skills.` });
+    return;
+  }
+
+  const message = createSkill(slug, name, description, instructions);
+  const created = readSkill(slug, "local");
+  if (!created.ok || !created.skill) {
+    res.status(400).json({ error: message });
+    return;
+  }
+
+  res.status(201).json({
+    ok: true,
+    message,
+    skill: created.skill,
+  });
+});
+
+app.put("/skills/:slug", (req: Request, res: Response) => {
+  const slug = getSlugParam(req);
+  const body = req.body as {
+    name?: string;
+    description?: string;
+    instructions?: string;
+  };
+
+  const update: {
+    name?: string;
+    description?: string;
+    instructions?: string;
+  } = {};
+
+  if (body.name !== undefined) {
+    if (typeof body.name !== "string") {
+      res.status(400).json({ error: "'name' must be a string when provided" });
+      return;
+    }
+    update.name = body.name;
+  }
+  if (body.description !== undefined) {
+    if (typeof body.description !== "string") {
+      res.status(400).json({ error: "'description' must be a string when provided" });
+      return;
+    }
+    update.description = body.description;
+  }
+  if (body.instructions !== undefined) {
+    if (typeof body.instructions !== "string") {
+      res.status(400).json({ error: "'instructions' must be a string when provided" });
+      return;
+    }
+    update.instructions = body.instructions;
+  }
+
+  if (Object.keys(update).length === 0) {
+    res.status(400).json({ error: "Provide at least one of 'name', 'description', or 'instructions' in request body" });
+    return;
+  }
+
+  const result = updateSkill(slug, update);
+  if (!result.ok || !result.skill) {
+    res.status(400).json({
+      error: result.message,
+      ...(result.errors ? { errors: result.errors } : {}),
+    });
+    return;
+  }
+
+  res.json({
+    ok: true,
+    message: result.message,
+    skill: result.skill,
+  });
+});
+
 // Remove a local skill
 app.delete("/skills/:slug", (req: Request, res: Response) => {
-  const slug = Array.isArray(req.params.slug) ? req.params.slug[0] : req.params.slug;
+  const slug = getSlugParam(req);
   const result = removeSkill(slug);
   if (!result.ok) {
     res.status(400).json({ error: result.message });
