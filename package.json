@@ -17,6 +17,8 @@
     "daemon": "tsx src/daemon.ts",
     "tui": "tsx src/tui/index.ts",
     "dev": "tsx --watch src/daemon.ts",
+    "dashboard": "cd packages/dashboard && npm run dev",
+    "dashboard:build": "cd packages/dashboard && npm run build",
     "prepublishOnly": "npm run build"
   },
   "engines": {

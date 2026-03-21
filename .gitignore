@@ -19,3 +19,8 @@ Thumbs.db
 .vscode/
 .idea/
 skills/blog-writer/
+
+# Dashboard
+packages/dashboard/.next/
+packages/dashboard/node_modules/
+logs/security/

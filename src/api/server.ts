@@ -10,6 +10,7 @@ import { searchMemories } from "../store/db.js";
 import { listSkills, removeSkill } from "../copilot/skills.js";
 import { restartDaemon } from "../daemon.js";
 import { API_TOKEN_PATH, ensureMaxHome } from "../paths.js";
+import { getHarnessStatus, readProgress, readFeatureList, HARNESS_DIR } from "../copilot/harness.js";
 
 // Ensure token file exists (generate on first run)
 let apiToken: string | null = null;
@@ -28,6 +29,15 @@ try {
 
 const app = express();
 app.use(express.json());
+
+// CORS for dashboard dev server
+app.use((_req: Request, res: Response, next: NextFunction) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Headers", "Authorization, Content-Type");
+  res.header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+  if (_req.method === "OPTIONS") { res.sendStatus(204); return; }
+  next();
+});
 
 // Bearer token authentication middleware (skip /status health check)
 app.use((req: Request, res: Response, next: NextFunction) => {
@@ -253,6 +263,94 @@ app.post("/send-photo", async (req: Request, res: Response) => {
     const msg = err instanceof Error ? err.message : String(err);
     res.status(500).json({ error: msg });
   }
+});
+
+// ── Harness API ──────────────────────────────────────────────────────────────
+
+// Get harness status for a project directory
+app.get("/harness", (req: Request, res: Response) => {
+  const dir = req.query.dir as string | undefined;
+  if (!dir || typeof dir !== "string") {
+    res.status(400).json({ error: "Missing 'dir' query parameter" });
+    return;
+  }
+
+  try {
+    const status = getHarnessStatus(dir);
+    const progress = status.phase !== "init" ? readProgress(dir) : [];
+    const featureList = status.phase !== "init" ? readFeatureList(dir) : null;
+    res.json({ ...status, progressLog: progress, features: featureList?.features ?? [] });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ error: msg });
+  }
+});
+
+// Start a new harness (delegates to orchestrator via prompt)
+app.post("/harness/start", (req: Request, res: Response) => {
+  const { dir, goal, connectionId } = req.body as {
+    dir?: string;
+    goal?: string;
+    connectionId?: string;
+  };
+
+  if (!dir || !goal) {
+    res.status(400).json({ error: "Missing 'dir' and/or 'goal' in request body" });
+    return;
+  }
+
+  if (!connectionId || !sseClients.has(connectionId)) {
+    res.status(400).json({ error: "Missing or invalid 'connectionId'. Connect to /stream first." });
+    return;
+  }
+
+  sendToOrchestrator(
+    `Create a harness worker session in ${dir} with harness mode enabled. The project goal is: ${goal}`,
+    { type: "tui", connectionId },
+    (text: string, done: boolean) => {
+      const sseRes = sseClients.get(connectionId);
+      if (sseRes) {
+        sseRes.write(
+          `data: ${JSON.stringify({ type: done ? "harness_started" : "delta", content: text })}\n\n`
+        );
+      }
+    }
+  );
+
+  res.json({ status: "queued" });
+});
+
+// Continue harness (delegates to orchestrator via prompt)
+app.post("/harness/continue", (req: Request, res: Response) => {
+  const { dir, connectionId } = req.body as {
+    dir?: string;
+    connectionId?: string;
+  };
+
+  if (!dir) {
+    res.status(400).json({ error: "Missing 'dir' in request body" });
+    return;
+  }
+
+  if (!connectionId || !sseClients.has(connectionId)) {
+    res.status(400).json({ error: "Missing or invalid 'connectionId'. Connect to /stream first." });
+    return;
+  }
+
+  sendToOrchestrator(
+    `Continue the harness in ${dir}. Call continue_harness with working_dir ${dir} to implement the next feature.`,
+    { type: "tui", connectionId },
+    (text: string, done: boolean) => {
+      const sseRes = sseClients.get(connectionId);
+      if (sseRes) {
+        sseRes.write(
+          `data: ${JSON.stringify({ type: done ? "harness_continued" : "delta", content: text })}\n\n`
+        );
+      }
+    }
+  );
+
+  res.json({ status: "queued" });
 });
 
 export function startApiServer(): Promise<void> {
