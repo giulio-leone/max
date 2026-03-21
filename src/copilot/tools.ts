@@ -9,6 +9,16 @@ import { config, persistModel } from "../config.js";
 import { SESSIONS_DIR } from "../paths.js";
 import { getCurrentSourceChannel } from "./orchestrator.js";
 import { getRouterConfig, updateRouterConfig } from "./router.js";
+import {
+  detectPhase,
+  getInitializerPrompt,
+  getCodingAgentPrompt,
+  getHarnessStatus,
+  getNextFeature,
+  readFeatureList,
+  readProgress,
+  type HarnessPhase,
+} from "./harness.js";
 
 function isTimeoutError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
@@ -62,6 +72,12 @@ export function createTools(deps: ToolDeps): Tool<any>[] {
         name: z.string().describe("Short descriptive name for the session, e.g. 'auth-fix'"),
         working_dir: z.string().describe("Absolute path to the directory to work in"),
         initial_prompt: z.string().optional().describe("Optional initial prompt to send to the worker"),
+        harness: z.boolean().optional().describe(
+          "Enable harness mode for long-running multi-session projects. " +
+          "When true, automatically detects the project phase (init vs coding) " +
+          "and injects the appropriate harness prompt. The worker will scaffold " +
+          "the project (init phase) or implement the next feature (coding phase)."
+        ),
       }),
       handler: async (args) => {
         if (deps.workers.has(args.name)) {
@@ -105,7 +121,31 @@ export function createTools(deps: ToolDeps): Tool<any>[] {
            VALUES (?, ?, ?, 'idle')`
         ).run(args.name, session.sessionId, args.working_dir);
 
-        if (args.initial_prompt) {
+        if (args.initial_prompt || args.harness) {
+          // Determine the actual prompt to send
+          let prompt: string;
+          let phaseLabel: string = "";
+
+          if (args.harness) {
+            const phase = detectPhase(args.working_dir);
+            if (phase === "init") {
+              const userGoal = args.initial_prompt || "Set up the project as described by existing files";
+              prompt = getInitializerPrompt(userGoal, args.working_dir);
+              phaseLabel = " [harness:init]";
+            } else if (phase === "coding") {
+              prompt = getCodingAgentPrompt(args.working_dir);
+              phaseLabel = " [harness:coding]";
+              const next = getNextFeature(args.working_dir);
+              if (next) {
+                phaseLabel += ` → ${next.id}`;
+              }
+            } else {
+              return `Harness in ${args.working_dir} is complete — all features pass! Use \`harness_status\` to see details.`;
+            }
+          } else {
+            prompt = `Working directory: ${args.working_dir}\n\n${args.initial_prompt}`;
+          }
+
           worker.status = "running";
           worker.startedAt = Date.now();
           db.prepare(
@@ -115,7 +155,7 @@ export function createTools(deps: ToolDeps): Tool<any>[] {
           const timeoutMs = config.workerTimeoutMs;
           // Non-blocking: dispatch work and return immediately
           session.sendAndWait({
-            prompt: `Working directory: ${args.working_dir}\n\n${args.initial_prompt}`,
+            prompt,
           }, timeoutMs).then((result) => {
             worker.lastOutput = result?.data?.content || "No response";
             deps.onWorkerComplete(args.name, worker.lastOutput);
@@ -130,7 +170,7 @@ export function createTools(deps: ToolDeps): Tool<any>[] {
             getDb().prepare(`DELETE FROM worker_sessions WHERE name = ?`).run(args.name);
           });
 
-          return `Worker '${args.name}' created in ${args.working_dir}. Task dispatched — I'll notify you when it's done.`;
+          return `Worker '${args.name}' created in ${args.working_dir}${phaseLabel}. Task dispatched — I'll notify you when it's done.`;
         }
 
         return `Worker '${args.name}' created in ${args.working_dir}. Use send_to_worker to send it prompts.`;
@@ -551,7 +591,139 @@ export function createTools(deps: ToolDeps): Tool<any>[] {
         return `Restarting Max${reason}. I'll be back in a few seconds.`;
       },
     }),
+
+    // ── Harness Tools ──────────────────────────────────────────────────────
+
+    defineTool("harness_status", {
+      description:
+        "Check the status of a project's agent harness. Shows phase (init/coding/complete), " +
+        "feature completion progress, and the next feature to implement. " +
+        "Use when the user asks about project progress or before deciding to continue a harness.",
+      parameters: z.object({
+        working_dir: z.string().describe("Absolute path to the project directory with a .max-harness/"),
+      }),
+      handler: async (args) => {
+        try {
+          const status = getHarnessStatus(args.working_dir);
+
+          if (status.phase === "init") {
+            return `No harness found in ${args.working_dir}. Use \`create_worker_session\` with \`harness: true\` to initialize one.`;
+          }
+
+          const progressBar = renderProgressBar(status.passing, status.total);
+          const lines = [
+            `📋 **Harness Status** — ${args.working_dir}`,
+            `Phase: ${status.phase}`,
+            `Goal: ${status.projectGoal}`,
+            `Progress: ${progressBar} ${status.passing}/${status.total} (${status.percentComplete}%)`,
+          ];
+
+          if (status.nextFeature) {
+            lines.push(`Next: \`${status.nextFeature.id}\` — ${status.nextFeature.description}`);
+          }
+
+          // Include recent progress log
+          const progress = readProgress(args.working_dir);
+          if (progress) {
+            const recentLines = progress.split("\n").slice(-10).join("\n");
+            lines.push(`\nRecent log:\n${recentLines}`);
+          }
+
+          return lines.join("\n");
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return `Error reading harness: ${msg}`;
+        }
+      },
+    }),
+
+    defineTool("continue_harness", {
+      description:
+        "Continue a harnessed project by spawning a new coding agent for the next failing feature. " +
+        "Equivalent to create_worker_session with harness:true, but automatically names the worker " +
+        "and targets the next feature. Use after a previous harness session completes.",
+      parameters: z.object({
+        working_dir: z.string().describe("Absolute path to the project directory with a .max-harness/"),
+      }),
+      handler: async (args) => {
+        const phase = detectPhase(args.working_dir);
+
+        if (phase === "init") {
+          return `No harness found in ${args.working_dir}. Use \`create_worker_session\` with \`harness: true\` and an \`initial_prompt\` describing the project to initialize.`;
+        }
+
+        if (phase === "complete") {
+          const status = getHarnessStatus(args.working_dir);
+          return `🎉 All ${status.total} features pass! The project is complete.`;
+        }
+
+        const nextFeature = getNextFeature(args.working_dir);
+        if (!nextFeature) {
+          return `No remaining features to implement.`;
+        }
+
+        // Auto-generate worker name from feature ID
+        const workerName = `harness-${nextFeature.id}`;
+
+        if (deps.workers.has(workerName)) {
+          return `Worker '${workerName}' already exists. Use send_to_worker to interact with it, or kill it first.`;
+        }
+
+        if (deps.workers.size >= MAX_CONCURRENT_WORKERS) {
+          const names = Array.from(deps.workers.keys()).join(", ");
+          return `Worker limit reached (${MAX_CONCURRENT_WORKERS}). Active: ${names}. Kill a session first.`;
+        }
+
+        const prompt = getCodingAgentPrompt(args.working_dir);
+
+        const session = await deps.client.createSession({
+          model: config.copilotModel,
+          configDir: SESSIONS_DIR,
+          workingDirectory: args.working_dir,
+          onPermissionRequest: approveAll,
+        });
+
+        const worker: WorkerInfo = {
+          name: workerName,
+          session,
+          workingDir: args.working_dir,
+          status: "running",
+          startedAt: Date.now(),
+          originChannel: getCurrentSourceChannel(),
+        };
+        deps.workers.set(workerName, worker);
+
+        const db = getDb();
+        db.prepare(
+          `INSERT OR REPLACE INTO worker_sessions (name, copilot_session_id, working_dir, status)
+           VALUES (?, ?, ?, 'running')`
+        ).run(workerName, session.sessionId, args.working_dir);
+
+        const timeoutMs = config.workerTimeoutMs;
+        session.sendAndWait({ prompt }, timeoutMs).then((result) => {
+          worker.lastOutput = result?.data?.content || "No response";
+          deps.onWorkerComplete(workerName, worker.lastOutput);
+        }).catch((err) => {
+          const errMsg = formatWorkerError(workerName, worker.startedAt!, timeoutMs, err);
+          worker.lastOutput = errMsg;
+          deps.onWorkerComplete(workerName, errMsg);
+        }).finally(() => {
+          session.destroy().catch(() => {});
+          deps.workers.delete(workerName);
+          getDb().prepare(`DELETE FROM worker_sessions WHERE name = ?`).run(workerName);
+        });
+
+        const status = getHarnessStatus(args.working_dir);
+        return `🔧 Coding agent '${workerName}' dispatched → implementing \`${nextFeature.id}\`: ${nextFeature.description}\n\nProgress: ${status.passing}/${status.total} features passing. I'll notify you when it's done.`;
+      },
+    }),
   ];
+}
+
+function renderProgressBar(done: number, total: number): string {
+  const width = 20;
+  const filled = total > 0 ? Math.round((done / total) * width) : 0;
+  return "█".repeat(filled) + "░".repeat(width - filled);
 }
 
 function formatAge(date: Date): string {
