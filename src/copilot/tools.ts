@@ -53,6 +53,8 @@ export interface WorkerInfo {
   startedAt?: number;
   /** Channel that created this worker — completions route back here. */
   originChannel?: "telegram" | "tui";
+  /** True if this worker is part of a harness flow (enables auto-continue). */
+  isHarnessWorker?: boolean;
 }
 
 export interface ToolDeps {
@@ -111,6 +113,7 @@ export function createTools(deps: ToolDeps): Tool<any>[] {
           workingDir: args.working_dir,
           status: "idle",
           originChannel: getCurrentSourceChannel(),
+          isHarnessWorker: args.harness === true,
         };
         deps.workers.set(args.name, worker);
 
@@ -690,6 +693,7 @@ export function createTools(deps: ToolDeps): Tool<any>[] {
           status: "running",
           startedAt: Date.now(),
           originChannel: getCurrentSourceChannel(),
+          isHarnessWorker: true,
         };
         deps.workers.set(workerName, worker);
 

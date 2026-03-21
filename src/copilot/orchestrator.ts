@@ -9,6 +9,8 @@ import { logConversation, getState, setState, deleteState, getMemorySummary, get
 import { SESSIONS_DIR } from "../paths.js";
 import { resolveModel, type Tier, type RouteResult } from "./router.js";
 
+import { detectPhase, getHarnessStatus, getNextFeature, getCodingAgentPrompt } from "./harness.js";
+
 const MAX_RETRIES = 3;
 const RECONNECT_DELAYS_MS = [1_000, 3_000, 10_000];
 const HEALTH_CHECK_INTERVAL_MS = 30_000;
@@ -89,7 +91,33 @@ function getSessionConfig() {
 export function feedBackgroundResult(workerName: string, result: string): void {
   const worker = workers.get(workerName);
   const channel = worker?.originChannel;
-  const prompt = `[Background task completed] Worker '${workerName}' finished:\n\n${result}`;
+  const isHarness = worker?.isHarnessWorker === true;
+  const workingDir = worker?.workingDir;
+
+  // Build the prompt the orchestrator will see
+  let prompt = `[Background task completed] Worker '${workerName}' finished:\n\n${result}`;
+
+  // Auto-continue harness: if more features remain, append a directive
+  if (isHarness && workingDir) {
+    try {
+      const phase = detectPhase(workingDir);
+      if (phase === "coding") {
+        const status = getHarnessStatus(workingDir);
+        const next = getNextFeature(workingDir);
+        if (next) {
+          prompt += `\n\n[Harness auto-continue] ${status.passing}/${status.total} features passing (${status.percentComplete}%). ` +
+            `Next feature: \`${next.id}\` — ${next.description}. ` +
+            `Use \`continue_harness\` with working_dir="${workingDir}" to proceed.`;
+        }
+      } else if (phase === "complete") {
+        const status = getHarnessStatus(workingDir);
+        prompt += `\n\n🎉 [Harness complete] All ${status.total} features pass! The project is done.`;
+      }
+    } catch {
+      // Non-fatal — just skip the auto-continue hint
+    }
+  }
+
   sendToOrchestrator(
     prompt,
     { type: "background" },
