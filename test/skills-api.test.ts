@@ -34,6 +34,10 @@ vi.mock("../src/telegram/bot.js", () => ({
   sendPhoto: vi.fn(async () => undefined),
 }));
 
+vi.mock("../src/copilot/client.js", () => ({
+  getClient: vi.fn(async () => ({})),
+}));
+
 vi.mock("../src/config.js", () => ({
   config: {
     apiPort: 7777,
@@ -52,7 +56,26 @@ vi.mock("../src/copilot/models.js", () => ({
 }));
 
 vi.mock("../src/store/db.js", () => ({
+  CHANNEL_ACCOUNT_TYPES: ["telegram", "tui", "background"],
+  addAgentMemory: vi.fn(),
+  addSessionMemory: vi.fn(),
+  createChannel: vi.fn(),
+  createChannelAccount: vi.fn(),
+  deleteChannel: vi.fn(),
+  deleteChannelAccount: vi.fn(),
+  getChannel: vi.fn(),
+  getChannelAccount: vi.fn(),
+  isChannelAccountType: (value: unknown) => ["telegram", "tui", "background"].includes(String(value)),
+  listChannelAccounts: vi.fn(() => []),
+  listChannelInbox: vi.fn(() => []),
+  listChannels: vi.fn(() => []),
+  removeAgentMemory: vi.fn(),
+  removeSessionMemory: vi.fn(),
+  searchAgentMemories: vi.fn(() => []),
   searchMemories: vi.fn(() => []),
+  searchSessionMemories: vi.fn(() => []),
+  updateChannel: vi.fn(),
+  updateChannelAccount: vi.fn(),
 }));
 
 vi.mock("../src/control-plane/store.js", () => ({
@@ -64,6 +87,7 @@ vi.mock("../src/control-plane/store.js", () => ({
   createProject: vi.fn(),
   createSchedule: vi.fn(),
   createTask: vi.fn(),
+  getAgent: vi.fn(() => ({ id: 1 })),
   getControlPlaneOverview: vi.fn(() => ({})),
   listAgents: vi.fn(() => []),
   listHeartbeats: vi.fn(() => []),
@@ -108,6 +132,20 @@ vi.mock("../src/copilot/skills.js", () => ({
   readSkill: hoisted.skillMocks.readSkill,
   removeSkill: hoisted.skillMocks.removeSkill,
   updateSkill: hoisted.skillMocks.updateSkill,
+}));
+
+vi.mock("../src/copilot/worker-sessions.js", () => ({
+  attachManagedSession: vi.fn(),
+  detachManagedSession: vi.fn(),
+  discoverMachineSessions: vi.fn(() => ({ ok: true, message: "", sessions: [] })),
+  findMachineSessionById: vi.fn(),
+  findManagedMachineWorker: vi.fn(() => undefined),
+  formatMachineSessionAge: vi.fn(() => "just now"),
+  getManagedSessionChatState: vi.fn(() => ({ session: null, history: [] })),
+  listManagedMachineWorkers: vi.fn(() => []),
+  routeManagedSessions: vi.fn(() => []),
+  sendManagedSessionChatMessage: vi.fn(),
+  updateManagedSessionMetadata: vi.fn(),
 }));
 
 const baseSkill = {

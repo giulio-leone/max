@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   fetchAvailableModels,
@@ -18,6 +19,7 @@ import {
   fetchProjects,
   fetchSchedules,
   fetchTasks,
+  fetchWorkers,
   pingAgent,
   runScheduleNow,
   runTaskNow,
@@ -27,13 +29,65 @@ import {
   updateSchedule,
   updateTask,
   type AgentRecord,
+  type CapabilityFamily,
   type AvailableModel,
   type ControlOverview,
   type HeartbeatRecord,
   type ProjectRecord,
   type ScheduleRecord,
   type TaskRecord,
+  type ToolProfile,
+  type Worker,
 } from "@/lib/api";
+import { indexWorkersByControlAgentId } from "@/lib/operator-context";
+
+const CAPABILITY_FAMILY_OPTIONS: CapabilityFamily[] = [
+  "browser",
+  "web",
+  "fs",
+  "runtime",
+  "message",
+  "cron",
+  "image",
+  "sessions",
+];
+
+const TOOL_PROFILE_OPTIONS: Array<{
+  id: ToolProfile;
+  label: string;
+  description: string;
+}> = [
+  {
+    id: "all",
+    label: "All capabilities",
+    description: "Expose every currently mapped family and keep unclassified MCP servers available.",
+  },
+  {
+    id: "core",
+    label: "Core operator",
+    description: "Keep the agent focused on Max-native runtime, messaging, and session control.",
+  },
+  {
+    id: "delivery",
+    label: "Delivery and comms",
+    description: "Bias toward communication-heavy work with web and image support.",
+  },
+  {
+    id: "automation",
+    label: "Automation and execution",
+    description: "Bias toward automation, browser/web work, cron, and worker-backed execution.",
+  },
+];
+
+function formatCapabilityFamilyLabel(family: CapabilityFamily) {
+  return family.charAt(0).toUpperCase() + family.slice(1);
+}
+
+function toggleFamilySelection(families: CapabilityFamily[], family: CapabilityFamily) {
+  return families.includes(family)
+    ? families.filter((value) => value !== family)
+    : [...families, family];
+}
 
 function formatTimestamp(value: string | null) {
   if (!value) return "—";
@@ -70,6 +124,7 @@ export default function ControlPlanePage() {
   const [agents, setAgents] = useState<AgentRecord[]>([]);
   const [schedules, setSchedules] = useState<ScheduleRecord[]>([]);
   const [heartbeats, setHeartbeats] = useState<HeartbeatRecord[]>([]);
+  const [workers, setWorkers] = useState<Worker[]>([]);
   const [availableModels, setAvailableModels] = useState<AvailableModel[]>([]);
   const [currentModel, setCurrentModel] = useState("");
   const [loading, setLoading] = useState(true);
@@ -97,6 +152,9 @@ export default function ControlPlanePage() {
     defaultPrompt: "",
     heartbeatPrompt: "",
     heartbeatIntervalSeconds: "",
+    toolProfile: "all" as ToolProfile,
+    allowedCapabilityFamilies: [] as CapabilityFamily[],
+    blockedCapabilityFamilies: [] as CapabilityFamily[],
     automationEnabled: true,
   });
   const [scheduleForm, setScheduleForm] = useState({
@@ -115,13 +173,14 @@ export default function ControlPlanePage() {
   const loadAll = useCallback(async () => {
     setLoading(true);
     try {
-      const [overviewData, projectsData, tasksData, agentsData, schedulesData, heartbeatsData, modelsData, currentModelData] = await Promise.all([
+      const [overviewData, projectsData, tasksData, agentsData, schedulesData, heartbeatsData, workersData, modelsData, currentModelData] = await Promise.all([
         fetchControlOverview(),
         fetchProjects(),
         fetchTasks(),
         fetchAgents(),
         fetchSchedules(),
         fetchHeartbeats(25),
+        fetchWorkers(),
         fetchAvailableModels(),
         fetchCurrentModel(),
       ]);
@@ -131,6 +190,7 @@ export default function ControlPlanePage() {
       setAgents(agentsData);
       setSchedules(schedulesData);
       setHeartbeats(heartbeatsData);
+      setWorkers(workersData);
       setAvailableModels(modelsData);
       setCurrentModel(currentModelData.model);
       setError(null);
@@ -190,6 +250,11 @@ export default function ControlPlanePage() {
     ];
   }, [agentForm.model, availableModels]);
 
+  const liveAgentWorkers = useMemo(
+    () => indexWorkersByControlAgentId(workers),
+    [workers]
+  );
+
   async function submitAction<T>(key: string, action: () => Promise<T>, onDone: () => void) {
     setSubmitting(key);
     try {
@@ -223,6 +288,9 @@ export default function ControlPlanePage() {
       defaultPrompt: "",
       heartbeatPrompt: "",
       heartbeatIntervalSeconds: "",
+      toolProfile: "all",
+      allowedCapabilityFamilies: [],
+      blockedCapabilityFamilies: [],
       automationEnabled: true,
     }));
     setEditingAgentId(null);
@@ -254,6 +322,8 @@ export default function ControlPlanePage() {
   }
 
   function beginAgentEdit(agent: AgentRecord) {
+    const allowedCapabilityFamilies = agent.allowedCapabilityFamilies ?? [];
+    const blockedCapabilityFamilies = agent.blockedCapabilityFamilies ?? [];
     setEditingAgentId(agent.id);
     setAgentForm({
       projectId: String(agent.projectId),
@@ -264,6 +334,9 @@ export default function ControlPlanePage() {
       defaultPrompt: agent.defaultPrompt ?? "",
       heartbeatPrompt: agent.heartbeatPrompt ?? "",
       heartbeatIntervalSeconds: agent.heartbeatIntervalSeconds ? String(agent.heartbeatIntervalSeconds) : "",
+      toolProfile: agent.toolProfile,
+      allowedCapabilityFamilies,
+      blockedCapabilityFamilies,
       automationEnabled: agent.automationEnabled,
     });
   }
@@ -632,6 +705,88 @@ export default function ControlPlanePage() {
                 />
               </Field>
             </div>
+            <div className="grid grid-cols-1 gap-3 lg:grid-cols-3">
+              <Field label="Tool profile">
+                <div className="space-y-2">
+                  <select
+                    className={inputClassName()}
+                    value={agentForm.toolProfile}
+                    onChange={(e) => setAgentForm((prev) => ({ ...prev, toolProfile: e.target.value as ToolProfile }))}
+                  >
+                    {TOOL_PROFILE_OPTIONS.map((profile) => (
+                      <option key={profile.id} value={profile.id}>
+                        {profile.label}
+                      </option>
+                    ))}
+                  </select>
+                  <p className="text-xs text-[var(--text-muted)]">
+                    {TOOL_PROFILE_OPTIONS.find((profile) => profile.id === agentForm.toolProfile)?.description}
+                  </p>
+                </div>
+              </Field>
+              <Field label="Allowed capability families">
+                <div className="rounded-lg border border-[var(--border)] p-3 space-y-2">
+                  <p className="text-xs text-[var(--text-muted)]">
+                    Leave empty to inherit the selected profile. Selecting families here explicitly adds them.
+                  </p>
+                  <div className="flex flex-wrap gap-2">
+                    {CAPABILITY_FAMILY_OPTIONS.map((family) => {
+                      const selected = agentForm.allowedCapabilityFamilies.includes(family);
+                      return (
+                        <button
+                          key={`allow-${family}`}
+                          type="button"
+                          onClick={() =>
+                            setAgentForm((prev) => ({
+                              ...prev,
+                              allowedCapabilityFamilies: toggleFamilySelection(prev.allowedCapabilityFamilies, family),
+                            }))
+                          }
+                          className={`px-2 py-1 rounded-full text-xs border ${
+                            selected
+                              ? "border-[var(--accent)] bg-[var(--accent-glow)] text-[var(--accent)]"
+                              : "border-[var(--border)] text-[var(--text-muted)] hover:border-[var(--accent)]"
+                          }`}
+                        >
+                          {formatCapabilityFamilyLabel(family)}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              </Field>
+              <Field label="Blocked capability families">
+                <div className="rounded-lg border border-[var(--border)] p-3 space-y-2">
+                  <p className="text-xs text-[var(--text-muted)]">
+                    Use this to explicitly remove families from the profile, even if the preset would normally include them.
+                  </p>
+                  <div className="flex flex-wrap gap-2">
+                    {CAPABILITY_FAMILY_OPTIONS.map((family) => {
+                      const selected = agentForm.blockedCapabilityFamilies.includes(family);
+                      return (
+                        <button
+                          key={`block-${family}`}
+                          type="button"
+                          onClick={() =>
+                            setAgentForm((prev) => ({
+                              ...prev,
+                              blockedCapabilityFamilies: toggleFamilySelection(prev.blockedCapabilityFamilies, family),
+                            }))
+                          }
+                          className={`px-2 py-1 rounded-full text-xs border ${
+                            selected
+                              ? "border-[rgba(239,68,68,0.4)] bg-[rgba(239,68,68,0.12)] text-[var(--danger)]"
+                              : "border-[var(--border)] text-[var(--text-muted)] hover:border-[rgba(239,68,68,0.4)]"
+                          }`}
+                        >
+                          {formatCapabilityFamilyLabel(family)}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              </Field>
+            </div>
             <p className="text-xs text-[var(--text-muted)]">
               `Default prompt` is the agent mission/profile. `Heartbeat tick prompt` is the single one-shot action executed on each cadence tick. Keep timing language in `heartbeat interval seconds`, not in the tick prompt.
             </p>
@@ -666,6 +821,9 @@ export default function ControlPlanePage() {
                       defaultPrompt: agentForm.defaultPrompt,
                       heartbeatPrompt: agentForm.heartbeatPrompt,
                       heartbeatIntervalSeconds: agentForm.heartbeatIntervalSeconds ? Number(agentForm.heartbeatIntervalSeconds) : null,
+                      toolProfile: agentForm.toolProfile,
+                      allowedCapabilityFamilies: agentForm.allowedCapabilityFamilies,
+                      blockedCapabilityFamilies: agentForm.blockedCapabilityFamilies,
                       automationEnabled: agentForm.automationEnabled,
                       status: editingAgent?.status,
                     })
@@ -678,6 +836,9 @@ export default function ControlPlanePage() {
                       defaultPrompt: agentForm.defaultPrompt,
                       heartbeatPrompt: agentForm.heartbeatPrompt,
                       heartbeatIntervalSeconds: agentForm.heartbeatIntervalSeconds ? Number(agentForm.heartbeatIntervalSeconds) : null,
+                      toolProfile: agentForm.toolProfile,
+                      allowedCapabilityFamilies: agentForm.allowedCapabilityFamilies,
+                      blockedCapabilityFamilies: agentForm.blockedCapabilityFamilies,
                       automationEnabled: true,
                     }),
                   resetAgentForm
@@ -701,76 +862,120 @@ export default function ControlPlanePage() {
               {agents.length === 0 ? (
                 <p className="text-sm text-[var(--text-muted)]">No agents yet.</p>
               ) : (
-                agents.map((agent) => (
-                  <div key={agent.id} className="rounded-lg border border-[var(--border)] p-3">
-                    <div className="flex items-start justify-between gap-3">
-                      <div>
-                        <p className="font-medium">{agent.name}</p>
-                        <p className="text-xs text-[var(--text-muted)]">{agent.projectName} · {agent.agentType}</p>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <span className="text-xs px-2 py-1 rounded-full bg-[rgba(34,197,94,0.15)] text-[var(--success)]">{agent.status}</span>
-                        <span className={`text-xs px-2 py-1 rounded-full ${agent.automationEnabled ? "bg-[rgba(59,130,246,0.15)] text-[var(--accent)]" : "bg-[rgba(148,163,184,0.15)] text-[var(--text-muted)]"}`}>
-                          automation {agent.automationEnabled ? "on" : "paused"}
-                        </span>
-                        <button
-                          onClick={() => beginAgentEdit(agent)}
-                          className="px-2 py-1 rounded-lg text-xs font-medium bg-[var(--bg)] border border-[var(--border)] hover:border-[var(--accent)]"
-                        >
-                          Edit
-                        </button>
-                        <button
-                          onClick={() => void submitAction(
-                            `toggle-agent-${agent.id}`,
-                            () => updateAgent(agent.id, {
-                              automationEnabled: !agent.automationEnabled,
-                            }),
-                            () => {}
+                agents.map((agent) => {
+                  const liveWorker = liveAgentWorkers.get(agent.id) ?? null;
+                  const allowedCapabilityFamilies = agent.allowedCapabilityFamilies ?? [];
+                  const blockedCapabilityFamilies = agent.blockedCapabilityFamilies ?? [];
+                  return (
+                    <div key={agent.id} className="rounded-lg border border-[var(--border)] p-3">
+                      <div className="flex items-start justify-between gap-3">
+                        <div>
+                          <p className="font-medium">{agent.name}</p>
+                          <p className="text-xs text-[var(--text-muted)]">{agent.projectName} · {agent.agentType}</p>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <span className="text-xs px-2 py-1 rounded-full bg-[rgba(34,197,94,0.15)] text-[var(--success)]">{agent.status}</span>
+                          {liveWorker && (
+                            <span className="text-xs px-2 py-1 rounded-full bg-[rgba(99,102,241,0.15)] text-[#a5b4fc]">
+                              worker {liveWorker.status}
+                            </span>
                           )}
-                          className="px-2 py-1 rounded-lg text-xs font-medium bg-[var(--bg)] border border-[var(--border)] hover:border-[var(--accent)]"
-                        >
-                          {agent.automationEnabled ? "Pause" : "Resume"}
-                        </button>
-                        <a
-                          href={`/chat?agentId=${agent.id}`}
-                          className="px-2 py-1 rounded-lg text-xs font-medium bg-[var(--accent-glow)] text-[var(--accent)] hover:opacity-90"
-                        >
-                          Chat
-                        </a>
-                        <button
-                          onClick={() => {
-                            if (window.confirm(`Delete agent "${agent.name}"?`)) {
-                              void submitAction(`delete-agent-${agent.id}`, () => deleteAgent(agent.id), resetAgentForm);
-                            }
-                          }}
-                          className="px-2 py-1 rounded-lg text-xs font-medium border border-[rgba(239,68,68,0.35)] text-[var(--danger)] hover:bg-[rgba(239,68,68,0.12)]"
-                        >
-                          Delete
-                        </button>
-                        <button
-                          onClick={() => void submitAction("heartbeat", () => pingAgent(agent.id, "Manual dashboard ping"), () => {})}
-                          className="px-2 py-1 rounded-lg text-xs font-medium bg-[var(--bg)] border border-[var(--border)] hover:border-[var(--accent)]"
-                        >
-                          Ping
-                        </button>
+                          {liveWorker?.originChannel && (
+                            <span className="text-xs px-2 py-1 rounded-full bg-[rgba(16,185,129,0.15)] text-[#86efac]">
+                              via {liveWorker.originChannel}
+                            </span>
+                          )}
+                          <span className={`text-xs px-2 py-1 rounded-full ${agent.automationEnabled ? "bg-[rgba(59,130,246,0.15)] text-[var(--accent)]" : "bg-[rgba(148,163,184,0.15)] text-[var(--text-muted)]"}`}>
+                            automation {agent.automationEnabled ? "on" : "paused"}
+                          </span>
+                          <button
+                            onClick={() => beginAgentEdit(agent)}
+                            className="px-2 py-1 rounded-lg text-xs font-medium bg-[var(--bg)] border border-[var(--border)] hover:border-[var(--accent)]"
+                          >
+                            Edit
+                          </button>
+                          <button
+                            onClick={() => void submitAction(
+                              `toggle-agent-${agent.id}`,
+                              () => updateAgent(agent.id, {
+                                automationEnabled: !agent.automationEnabled,
+                              }),
+                              () => {}
+                            )}
+                            className="px-2 py-1 rounded-lg text-xs font-medium bg-[var(--bg)] border border-[var(--border)] hover:border-[var(--accent)]"
+                          >
+                            {agent.automationEnabled ? "Pause" : "Resume"}
+                          </button>
+                          <Link
+                            href={`/chat?agentId=${agent.id}`}
+                            className="px-2 py-1 rounded-lg text-xs font-medium bg-[var(--accent-glow)] text-[var(--accent)] hover:opacity-90"
+                          >
+                            Chat
+                          </Link>
+                          {liveWorker?.originChannel ? (
+                            <Link
+                              href={`/channels?accountType=${encodeURIComponent(liveWorker.originChannel)}`}
+                              className="px-2 py-1 rounded-lg text-xs font-medium bg-[var(--bg)] border border-[var(--border)] hover:border-[var(--accent)]"
+                            >
+                              Channels
+                            </Link>
+                          ) : null}
+                          <button
+                            onClick={() => {
+                              if (window.confirm(`Delete agent "${agent.name}"?`)) {
+                                void submitAction(`delete-agent-${agent.id}`, () => deleteAgent(agent.id), resetAgentForm);
+                              }
+                            }}
+                            className="px-2 py-1 rounded-lg text-xs font-medium border border-[rgba(239,68,68,0.35)] text-[var(--danger)] hover:bg-[rgba(239,68,68,0.12)]"
+                          >
+                            Delete
+                          </button>
+                          <button
+                            onClick={() => void submitAction("heartbeat", () => pingAgent(agent.id, "Manual dashboard ping"), () => {})}
+                            className="px-2 py-1 rounded-lg text-xs font-medium bg-[var(--bg)] border border-[var(--border)] hover:border-[var(--accent)]"
+                          >
+                            Ping
+                          </button>
+                        </div>
                       </div>
-                    </div>
-                    <p className="text-xs text-[var(--text-muted)] mt-2">
-                      Model: <span className="font-mono">{agent.model ?? "Max default"}</span>
-                    </p>
-                    <p className="text-sm text-[var(--text-muted)] mt-2">
-                      Mission: {agent.defaultPrompt ?? agent.workingDir ?? "No default prompt yet."}
-                    </p>
-                    <p className="text-sm text-[var(--text-muted)] mt-1">
-                      Tick: {agent.heartbeatPrompt ?? "No heartbeat tick prompt yet."}
-                    </p>
-                    {agent.heartbeatIntervalSeconds && agent.heartbeatPrompt && (
                       <p className="text-xs text-[var(--text-muted)] mt-2">
-                        Auto-executes the heartbeat tick prompt every {agent.heartbeatIntervalSeconds}s when automation is enabled.
+                        Model: <span className="font-mono">{agent.model ?? "Max default"}</span>
                       </p>
-                    )}
-                  </div>
-                ))
+                      <p className="text-xs text-[var(--text-muted)] mt-1">
+                        Policy: <span className="font-mono">{agent.toolProfile}</span>
+                        {allowedCapabilityFamilies.length > 0
+                          ? ` · allow ${allowedCapabilityFamilies.join(", ")}`
+                          : ""}
+                        {blockedCapabilityFamilies.length > 0
+                          ? ` · block ${blockedCapabilityFamilies.join(", ")}`
+                          : ""}
+                      </p>
+                      <p className="text-sm text-[var(--text-muted)] mt-2">
+                        Mission: {agent.defaultPrompt ?? agent.workingDir ?? "No default prompt yet."}
+                      </p>
+                      {liveWorker && (
+                        <p className="text-xs text-[var(--text-muted)] mt-2">
+                          Live worker: <span className="font-mono">{liveWorker.name}</span>
+                          {liveWorker.routingHint ? ` · route ${liveWorker.routingHint}` : ""}
+                          {liveWorker.queueHint ? ` · queue ${liveWorker.queueHint}` : ""}
+                          {liveWorker.originChannel ? ` · via ${liveWorker.originChannel}` : ""}
+                        </p>
+                      )}
+                      {liveWorker?.lastOutput && (
+                        <p className="text-xs text-[var(--text-muted)] mt-1 truncate">
+                          Latest worker output: {liveWorker.lastOutput}
+                        </p>
+                      )}
+                      <p className="text-sm text-[var(--text-muted)] mt-1">
+                        Tick: {agent.heartbeatPrompt ?? "No heartbeat tick prompt yet."}
+                      </p>
+                      {agent.heartbeatIntervalSeconds && agent.heartbeatPrompt && (
+                        <p className="text-xs text-[var(--text-muted)] mt-2">
+                          Auto-executes the heartbeat tick prompt every {agent.heartbeatIntervalSeconds}s when automation is enabled.
+                        </p>
+                      )}
+                    </div>
+                  )})
               )}
             </div>
           </div>

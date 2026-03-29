@@ -5,7 +5,16 @@ import { config, DEFAULT_MODEL } from "../config.js";
 import { loadMcpConfig } from "./mcp-config.js";
 import { getSkillDirectories } from "./skills.js";
 import { resetClient } from "./client.js";
-import { logConversation, getState, setState, deleteState, getMemorySummary, getRecentConversation } from "../store/db.js";
+import {
+  createInboxMessage,
+  deleteState,
+  getMemorySummary,
+  getRecentConversation,
+  getState,
+  logConversation,
+  resolveMessageChannelAccess,
+  setState,
+} from "../store/db.js";
 import { SESSIONS_DIR } from "../paths.js";
 import { resolveModel, type Tier, type RouteResult } from "./router.js";
 
@@ -18,9 +27,9 @@ const HEALTH_CHECK_INTERVAL_MS = 30_000;
 const ORCHESTRATOR_SESSION_KEY = "orchestrator_session_id";
 
 export type MessageSource =
-  | { type: "telegram"; chatId: number; messageId: number }
-  | { type: "tui"; connectionId: string }
-  | { type: "background" };
+  | { type: "telegram"; chatId: number; messageId: number; channelId?: number; routeHint?: string; senderId?: string }
+  | { type: "tui"; connectionId: string; channelId?: number; routeHint?: string; senderId?: string }
+  | { type: "background"; channelId?: number; routeHint?: string; senderId?: string };
 
 export type MessageCallback = (text: string, done: boolean) => void;
 
@@ -378,6 +387,31 @@ function isRecoverableError(err: unknown): boolean {
   return /timeout|disconnect|connection|EPIPE|ECONNRESET|ECONNREFUSED|socket|closed|ENOENT|spawn|not found|expired|stale/i.test(msg);
 }
 
+function getInboxMessageMetadata(source: MessageSource): Record<string, unknown> {
+  if (source.type === "telegram") {
+    return {
+      sourceType: "telegram",
+      chatId: source.chatId,
+      messageId: source.messageId,
+      ...(source.routeHint ? { routeHint: source.routeHint } : {}),
+      ...(source.senderId ? { senderId: source.senderId } : {}),
+    };
+  }
+  if (source.type === "tui") {
+    return {
+      sourceType: "tui",
+      connectionId: source.connectionId,
+      ...(source.routeHint ? { routeHint: source.routeHint } : {}),
+      ...(source.senderId ? { senderId: source.senderId } : {}),
+    };
+  }
+  return {
+    sourceType: "background",
+    ...(source.routeHint ? { routeHint: source.routeHint } : {}),
+    ...(source.senderId ? { senderId: source.senderId } : {}),
+  };
+}
+
 export async function sendToOrchestrator(
   prompt: string,
   source: MessageSource,
@@ -388,6 +422,53 @@ export async function sendToOrchestrator(
     source.type === "tui" ? "tui" : "background";
   logMessage("in", sourceLabel, prompt);
 
+  let resolvedChannelId = source.channelId;
+  let allowlistDenied = false;
+  const logInboxMessage = (
+    direction: "in" | "out",
+    role: "user" | "assistant" | "system",
+    content: string,
+  ) => {
+    try {
+      const decision = source.type === "telegram"
+        ? resolveMessageChannelAccess({
+          type: "telegram",
+          chatId: source.chatId,
+          messageId: source.messageId,
+          channelId: resolvedChannelId,
+          routeHint: source.routeHint,
+          senderId: source.senderId,
+        })
+        : source.type === "tui"
+          ? resolveMessageChannelAccess({
+            type: "tui",
+            connectionId: source.connectionId,
+            channelId: resolvedChannelId,
+            routeHint: source.routeHint,
+            senderId: source.senderId,
+          })
+          : resolveMessageChannelAccess({
+            type: "background",
+            channelId: resolvedChannelId,
+            routeHint: source.routeHint,
+            senderId: source.senderId,
+          });
+
+      resolvedChannelId = decision.resolution.channel.id;
+      allowlistDenied = !decision.allowed;
+      createInboxMessage({
+        channelId: decision.resolution.channel.id,
+        direction,
+        role,
+        content,
+        metadata: getInboxMessageMetadata(source),
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[max] Failed to log ${direction} inbox message: ${message}`);
+    }
+  };
+
   // Tag the prompt with its source channel
   const taggedPrompt = source.type === "background"
     ? prompt
@@ -395,6 +476,41 @@ export async function sendToOrchestrator(
 
   // Log role: background events are "system", user messages are "user"
   const logRole = source.type === "background" ? "system" : "user";
+  logInboxMessage("in", logRole, prompt);
+  if (allowlistDenied) {
+    const denialMessage = source.type === "telegram"
+      ? resolveMessageChannelAccess({
+        type: "telegram",
+        chatId: source.chatId,
+        messageId: source.messageId,
+        channelId: resolvedChannelId,
+        routeHint: source.routeHint,
+        senderId: source.senderId,
+      }).denialReason
+      : source.type === "tui"
+        ? resolveMessageChannelAccess({
+          type: "tui",
+          connectionId: source.connectionId,
+          channelId: resolvedChannelId,
+          routeHint: source.routeHint,
+          senderId: source.senderId,
+        }).denialReason
+        : resolveMessageChannelAccess({
+          type: "background",
+          channelId: resolvedChannelId,
+          routeHint: source.routeHint,
+          senderId: source.senderId,
+        }).denialReason;
+
+    if (denialMessage) {
+      callback(denialMessage, true);
+      try { logMessage("out", sourceLabel, denialMessage); } catch { /* best-effort */ }
+      try { logConversation(logRole, prompt, sourceLabel); } catch { /* best-effort */ }
+      try { logConversation("system", denialMessage, sourceLabel); } catch { /* best-effort */ }
+      logInboxMessage("out", "system", denialMessage);
+      return;
+    }
+  }
 
   // Determine the source channel for worker origin tracking
   const sourceChannel: "telegram" | "tui" | undefined =
@@ -415,6 +531,7 @@ export async function sendToOrchestrator(
         // Log both sides of the conversation after delivery
         try { logConversation(logRole, prompt, sourceLabel); } catch { /* best-effort */ }
         try { logConversation("assistant", finalContent, sourceLabel); } catch { /* best-effort */ }
+        logInboxMessage("out", "assistant", finalContent);
         return;
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);

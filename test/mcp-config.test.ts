@@ -41,7 +41,7 @@ describe("mcp-config helpers", () => {
       "utf-8"
     );
 
-    const { loadMcpConfig, readMcpConfig } = await loadMcpModule(tempHome);
+    const { loadMaxMcpConfig, readMcpConfig } = await loadMcpModule(tempHome);
     const readResult = readMcpConfig();
 
     expect(readResult.ok).toBe(true);
@@ -51,7 +51,7 @@ describe("mcp-config helpers", () => {
       args: ["-y", "demo-server"],
       tools: ["*"],
     });
-    expect(loadMcpConfig().demo).toMatchObject({
+    expect(loadMaxMcpConfig().demo).toMatchObject({
       command: "npx",
       args: ["-y", "demo-server"],
       tools: ["*"],
@@ -82,6 +82,8 @@ describe("mcp-config helpers", () => {
       command: "npx",
       args: ["-y", "browser-server"],
       tools: ["*"],
+      toolPrefix: "mcp_browser",
+      toolsSource: "configured",
       env: {
         BROWSER_HEADLESS: "1",
       },
@@ -92,6 +94,10 @@ describe("mcp-config helpers", () => {
       type: "sse",
       url: "http://127.0.0.1:7779/sse",
       tools: ["read_page", "capture_screenshot"],
+      eagerDiscovery: true,
+      discoveryTimeoutMs: 15000,
+      toolsSource: "discovered",
+      discoveredAt: "2026-03-22T00:00:00.000Z",
       headers: {
         Authorization: "Bearer test-token",
       },
@@ -106,6 +112,10 @@ describe("mcp-config helpers", () => {
       type: "sse",
       url: "http://127.0.0.1:7779/sse",
       tools: ["read_page", "capture_screenshot"],
+      eagerDiscovery: true,
+      discoveryTimeoutMs: 15000,
+      toolsSource: "discovered",
+      discoveredAt: "2026-03-22T00:00:00.000Z",
     });
   });
 
@@ -126,11 +136,11 @@ describe("mcp-config helpers", () => {
       "utf-8"
     );
 
-    const { loadMcpConfig, removeMcpServer } = await loadMcpModule(tempHome);
+    const { loadMaxMcpConfig, removeMcpServer } = await loadMcpModule(tempHome);
     const result = removeMcpServer("removable");
 
     expect(result.ok).toBe(true);
-    expect(loadMcpConfig().removable).toBeUndefined();
+    expect(loadMaxMcpConfig().removable).toBeUndefined();
   });
 
   it("rejects invalid persisted server configs", async () => {
@@ -150,5 +160,20 @@ describe("mcp-config helpers", () => {
     });
     expect(invalidResult.ok).toBe(false);
     expect(invalidResult.errors).toContain("Local MCP servers must include a non-empty 'command'.");
+
+    const invalidDiscoveryMetadata = validateMcpServerConfig("discovery-demo", {
+      command: "npx",
+      args: ["-y", "demo-server"],
+      tools: ["*"],
+      toolPrefix: "",
+      eagerDiscovery: "yes",
+      discoveryTimeoutMs: -5,
+      toolsSource: "unknown",
+    });
+    expect(invalidDiscoveryMetadata.valid).toBe(false);
+    expect(invalidDiscoveryMetadata.errors).toContain("'toolPrefix' cannot be empty when provided.");
+    expect(invalidDiscoveryMetadata.errors).toContain("'eagerDiscovery' must be a boolean when provided.");
+    expect(invalidDiscoveryMetadata.errors).toContain("'discoveryTimeoutMs' must be a positive number when provided.");
+    expect(invalidDiscoveryMetadata.errors).toContain("'toolsSource' must be either 'configured' or 'discovered' when provided.");
   });
 });

@@ -2,7 +2,7 @@ import { getClient, stopClient } from "./copilot/client.js";
 import { initOrchestrator, setMessageLogger, setProactiveNotify, getWorkers } from "./copilot/orchestrator.js";
 import { startApiServer, broadcastToSSE } from "./api/server.js";
 import { createBot, startBot, stopBot, sendProactiveMessage } from "./telegram/bot.js";
-import { getDb, closeDb } from "./store/db.js";
+import { closeDb, deleteWorkerSession, getDb } from "./store/db.js";
 import { config } from "./config.js";
 import { spawn } from "child_process";
 import { checkForUpdate } from "./update.js";
@@ -12,6 +12,11 @@ import {
   stopControlPlaneHeartbeatMonitor,
 } from "./control-plane/heartbeat-monitor.js";
 import { runControlPlaneLegacyCutoff } from "./control-plane/store.js";
+import {
+  listDestroyableWorkers,
+  listPersistentMachineWorkers,
+  recoverPersistedWorkerSessions,
+} from "./copilot/worker-sessions.js";
 
 function truncate(text: string, max = 200): string {
   const oneLine = text.replace(/\n/g, " ").trim();
@@ -59,6 +64,17 @@ async function main(): Promise<void> {
   console.log("[max] Creating orchestrator session...");
   await initOrchestrator(client);
   console.log("[max] Orchestrator session ready");
+
+  const recoveredWorkers = await recoverPersistedWorkerSessions({
+    client,
+    workers: getWorkers(),
+  });
+  if (recoveredWorkers.recovered > 0 || recoveredWorkers.cleared > 0) {
+    console.log(
+      `[max] Recovered ${recoveredWorkers.recovered} persisted worker session(s)`
+      + (recoveredWorkers.cleared > 0 ? ` and cleared ${recoveredWorkers.cleared} stale session(s)` : "")
+    );
+  }
 
   // Wire up proactive notifications — route to the originating channel
   setProactiveNotify((text, channel) => {
@@ -116,7 +132,9 @@ async function shutdown(): Promise<void> {
 
   // Check for active workers before shutting down
   const workers = getWorkers();
-  const running = Array.from(workers.values()).filter(w => w.status === "running");
+  const destroyableWorkers = listDestroyableWorkers(workers);
+  const persistentMachineWorkers = listPersistentMachineWorkers(workers);
+  const running = destroyableWorkers.filter(w => w.status === "running");
 
   if (running.length > 0 && shutdownState === "idle") {
     const names = running.map(w => w.name).join(", ");
@@ -143,10 +161,16 @@ async function shutdown(): Promise<void> {
   stopControlPlaneScheduler();
   stopControlPlaneHeartbeatMonitor();
 
-  // Destroy all active worker sessions to free memory
+  if (persistentMachineWorkers.length > 0) {
+    console.log(`[max] Detaching ${persistentMachineWorkers.length} attached machine session(s) without destroying them`);
+  }
+
   await Promise.allSettled(
-    Array.from(workers.values()).map((w) => w.session.destroy())
+    destroyableWorkers.map((w) => w.session.destroy())
   );
+  for (const worker of destroyableWorkers) {
+    deleteWorkerSession(worker.name);
+  }
   workers.clear();
 
   try { await stopClient(); } catch { /* best effort */ }
@@ -160,9 +184,14 @@ export async function restartDaemon(): Promise<void> {
   console.log("[max] Restarting...");
 
   const activeWorkers = getWorkers();
-  const runningCount = Array.from(activeWorkers.values()).filter(w => w.status === "running").length;
+  const destroyableWorkers = listDestroyableWorkers(activeWorkers);
+  const persistentMachineWorkers = listPersistentMachineWorkers(activeWorkers);
+  const runningCount = destroyableWorkers.filter(w => w.status === "running").length;
   if (runningCount > 0) {
     console.log(`[max] ⚠ Destroying ${runningCount} active worker(s) for restart`);
+  }
+  if (persistentMachineWorkers.length > 0) {
+    console.log(`[max] Keeping ${persistentMachineWorkers.length} attached machine session(s) available for recovery after restart`);
   }
 
   if (config.telegramEnabled) {
@@ -173,10 +202,13 @@ export async function restartDaemon(): Promise<void> {
   stopControlPlaneScheduler();
   stopControlPlaneHeartbeatMonitor();
 
-  // Destroy all active worker sessions to free memory
+  // Destroy Max-owned worker sessions. Attached machine sessions stay alive and are recovered on boot.
   await Promise.allSettled(
-    Array.from(activeWorkers.values()).map((w) => w.session.destroy())
+    destroyableWorkers.map((w) => w.session.destroy())
   );
+  for (const worker of destroyableWorkers) {
+    deleteWorkerSession(worker.name);
+  }
   activeWorkers.clear();
 
   try { await stopClient(); } catch { /* best effort */ }

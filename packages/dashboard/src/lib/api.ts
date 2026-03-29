@@ -1,3 +1,5 @@
+import { normalizeAgentRecord } from "./agent-records";
+
 const API_BASE = "/api/max";
 
 let cachedToken: string | null = null;
@@ -69,11 +71,26 @@ export interface Worker {
   status: string;
   lastOutput?: string;
   isHarnessWorker?: boolean;
+  controlAgentId?: number | null;
+  originChannel?: "telegram" | "tui" | null;
+  sessionSource?: "max" | "machine" | null;
+  copilotSessionId?: string | null;
+  workspaceLabel?: string | null;
+  activationMode?: "manual" | "suggested" | "pinned";
+  routingHint?: string | null;
+  queueHint?: string | null;
 }
 
 export interface MaxStatus {
   status: string;
   workers: Worker[];
+}
+
+export interface NativeMachineSession {
+  id: string;
+  workingDir: string;
+  summary: string;
+  updatedAt: string;
 }
 
 export interface ControlOverview {
@@ -131,6 +148,9 @@ export interface AgentRecord {
   defaultPrompt: string | null;
   heartbeatPrompt: string | null;
   heartbeatIntervalSeconds: number | null;
+  toolProfile: ToolProfile;
+  allowedCapabilityFamilies: CapabilityFamily[];
+  blockedCapabilityFamilies: CapabilityFamily[];
   automationEnabled: boolean;
   status: string;
   lastHeartbeatAt: string | null;
@@ -167,6 +187,58 @@ export interface HeartbeatRecord {
   recordedAt: string;
 }
 
+export type ChannelAccountType = "telegram" | "tui" | "background";
+
+export interface ChannelAccountRecord {
+  id: number;
+  type: ChannelAccountType;
+  name: string;
+  metadata: Record<string, unknown> | null;
+  createdAt: string;
+  updatedAt: string;
+  deletedAt: string | null;
+}
+
+export interface ChannelRecord {
+  id: number;
+  accountId: number;
+  accountType: ChannelAccountType;
+  accountName: string;
+  name: string;
+  displayName: string | null;
+  icon: string | null;
+  settings: Record<string, unknown> | null;
+  createdAt: string;
+  updatedAt: string;
+  deletedAt: string | null;
+}
+
+export interface InboxMessageRecord {
+  id: number;
+  channelId: number;
+  direction: "in" | "out";
+  role: "user" | "assistant" | "system";
+  content: string;
+  metadata: Record<string, unknown> | null;
+  createdAt: string;
+  channel: {
+    id: number;
+    name: string;
+    displayName: string | null;
+    icon: string | null;
+  };
+  account: {
+    id: number;
+    type: ChannelAccountType;
+    name: string;
+  };
+}
+
+export interface ChannelInboxState {
+  channel: ChannelRecord;
+  messages: InboxMessageRecord[];
+}
+
 export interface AvailableModel {
   id: string;
   label: string;
@@ -184,6 +256,29 @@ export interface AgentChatMessage {
 export interface AgentChatState {
   agent: AgentRecord;
   history: AgentChatMessage[];
+}
+
+export interface NativeSessionChatMessage {
+  id: number;
+  sessionName: string;
+  role: "user" | "assistant" | "system";
+  content: string;
+  createdAt: string;
+}
+
+export interface NativeSessionChatState {
+  session: Worker;
+  history: NativeSessionChatMessage[];
+}
+
+export interface ScopedMemoryRecord {
+  id: number;
+  scopeType: "agent" | "session";
+  scopeId: string;
+  category: "preference" | "fact" | "project" | "person" | "routine";
+  content: string;
+  source: string;
+  createdAt: string;
 }
 
 export type SkillSource = "bundled" | "local" | "global";
@@ -211,6 +306,12 @@ export interface SkillMutationResponse {
 export interface McpServerConfigRecord {
   displayName?: string;
   tools?: string[];
+  toolPrefix?: string;
+  eagerDiscovery?: boolean;
+  discoveryTimeoutMs?: number;
+  toolsSource?: "configured" | "discovered";
+  discoveredAt?: string;
+  discoveryError?: string;
   type?: string;
   command?: string;
   args?: string[];
@@ -244,6 +345,89 @@ export interface McpServerMutationResponse {
   server?: McpServerConfigRecord;
 }
 
+export interface McpServerDiscoveryResponse extends McpServerMutationResponse {
+  discoveredTools: Array<{
+    name: string;
+    description: string;
+  }>;
+}
+
+export type CapabilityFamily = "browser" | "web" | "fs" | "runtime" | "message" | "cron" | "image" | "sessions";
+export type CapabilitySource = "builtin" | "skill" | "mcp";
+export type ToolProfile = "all" | "core" | "delivery" | "automation";
+
+export interface CapabilityRecord {
+  id: string;
+  family: CapabilityFamily;
+  name: string;
+  description: string;
+  sourceType: CapabilitySource;
+  sourceName: string;
+  available: boolean;
+  tools: string[];
+  surfaces: string[];
+}
+
+export interface CapabilityFamilyGroup {
+  id: CapabilityFamily;
+  label: string;
+  description: string;
+  capabilityCount: number;
+  availableCount: number;
+  capabilities: CapabilityRecord[];
+}
+
+export interface UnclassifiedCapabilitySource {
+  id: string;
+  name: string;
+  description: string;
+  sourceType: "skill" | "mcp";
+}
+
+export interface CapabilityRegistry {
+  generatedAt: string;
+  totals: {
+    families: number;
+    populatedFamilies: number;
+    capabilities: number;
+    unclassified: number;
+  };
+  families: CapabilityFamilyGroup[];
+  unclassified: {
+    skills: UnclassifiedCapabilitySource[];
+    mcpServers: UnclassifiedCapabilitySource[];
+  };
+}
+
+export interface CapabilityAdapterRecord {
+  id: string;
+  family: CapabilityFamily | null;
+  name: string;
+  description: string;
+  sourceType: "skill" | "mcp";
+  sourceName: string;
+  available: boolean;
+  tools: string[];
+  surfaces: string[];
+  runtimeTarget: string;
+  toolPrefix?: string;
+  toolsSource?: "configured" | "discovered";
+  discoveredAt?: string;
+  eagerDiscovery?: boolean;
+}
+
+export interface CapabilityAdapterRegistry {
+  generatedAt: string;
+  totals: {
+    adapters: number;
+    skills: number;
+    mcpServers: number;
+    classified: number;
+    unclassified: number;
+  };
+  adapters: CapabilityAdapterRecord[];
+}
+
 export async function fetchHarnessStatus(dir: string): Promise<HarnessStatus> {
   const res = await fetch(`${API_BASE}/harness?dir=${encodeURIComponent(dir)}`, {
     headers: await getAuthHeaders(),
@@ -262,6 +446,82 @@ export async function fetchWorkers(): Promise<Worker[]> {
   const res = await fetch(`${API_BASE}/sessions`, { headers: await getAuthHeaders() });
   if (!res.ok) throw new Error(`API error: ${res.status}`);
   return res.json();
+}
+
+export async function discoverNativeSessions(options?: {
+  cwdFilter?: string;
+  limit?: number;
+}): Promise<NativeMachineSession[]> {
+  const query = new URLSearchParams();
+  if (options?.cwdFilter) {
+    query.set("cwdFilter", options.cwdFilter);
+  }
+  if (typeof options?.limit === "number") {
+    query.set("limit", String(options.limit));
+  }
+
+  const suffix = query.size > 0 ? `?${query.toString()}` : "";
+  const res = await fetch(`${API_BASE}/native-sessions/discover${suffix}`, {
+    headers: await getAuthHeaders(),
+  });
+  if (!res.ok) throw new Error(await getApiErrorMessage(res));
+  const data = await res.json() as { sessions?: NativeMachineSession[] };
+  return data.sessions ?? [];
+}
+
+export async function attachNativeSession(payload: {
+  sessionId: string;
+  name: string;
+}) {
+  const res = await fetch(`${API_BASE}/native-sessions/attach`, {
+    method: "POST",
+    headers: await getAuthHeaders(),
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error(await getApiErrorMessage(res));
+  return res.json() as Promise<{ ok: boolean; message: string; worker: Worker }>;
+}
+
+export async function detachNativeSession(name: string) {
+  const res = await fetch(`${API_BASE}/native-sessions/${encodeURIComponent(name)}`, {
+    method: "DELETE",
+    headers: await getAuthHeaders(),
+  });
+  if (!res.ok) throw new Error(await getApiErrorMessage(res));
+  return res.json() as Promise<{ ok: boolean; message: string; workerName: string }>;
+}
+
+export async function updateNativeSessionMetadata(name: string, payload: {
+  workspaceLabel?: string | null;
+  activationMode?: "manual" | "suggested" | "pinned";
+  routingHint?: string | null;
+  queueHint?: string | null;
+}) {
+  const res = await fetch(`${API_BASE}/native-sessions/${encodeURIComponent(name)}/metadata`, {
+    method: "PATCH",
+    headers: await getAuthHeaders(),
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error(await getApiErrorMessage(res));
+  return res.json() as Promise<{ ok: boolean; message: string; worker: Worker }>;
+}
+
+export async function previewNativeSessionRoute(query: {
+  workspaceLabel?: string;
+  routingHint?: string;
+  queueHint?: string;
+}): Promise<Worker[]> {
+  const search = new URLSearchParams();
+  if (query.workspaceLabel) search.set("workspaceLabel", query.workspaceLabel);
+  if (query.routingHint) search.set("routingHint", query.routingHint);
+  if (query.queueHint) search.set("queueHint", query.queueHint);
+  const suffix = search.size > 0 ? `?${search.toString()}` : "";
+  const res = await fetch(`${API_BASE}/native-sessions/route${suffix}`, {
+    headers: await getAuthHeaders(),
+  });
+  if (!res.ok) throw new Error(await getApiErrorMessage(res));
+  const data = await res.json() as { sessions?: Worker[] };
+  return data.sessions ?? [];
 }
 
 export async function fetchRecentHarnessDirs(): Promise<string[]> {
@@ -347,6 +607,145 @@ export async function fetchMcpServers(): Promise<McpServerListResponse> {
   return res.json();
 }
 
+export async function fetchCapabilityRegistry(options?: {
+  family?: CapabilityFamily;
+  query?: string;
+}): Promise<CapabilityRegistry> {
+  const params = new URLSearchParams();
+  if (options?.family) params.set("family", options.family);
+  if (options?.query) params.set("q", options.query);
+  const suffix = params.size > 0 ? `?${params.toString()}` : "";
+  const res = await fetch(`${API_BASE}/capabilities${suffix}`, { headers: await getAuthHeaders() });
+  if (!res.ok) throw new Error(await getApiErrorMessage(res));
+  return res.json();
+}
+
+export async function fetchCapabilityAdapters(options?: {
+  family?: CapabilityFamily;
+  query?: string;
+}): Promise<CapabilityAdapterRegistry> {
+  const params = new URLSearchParams();
+  if (options?.family) params.set("family", options.family);
+  if (options?.query) params.set("q", options.query);
+  const suffix = params.size > 0 ? `?${params.toString()}` : "";
+  const res = await fetch(`${API_BASE}/capability-adapters${suffix}`, { headers: await getAuthHeaders() });
+  if (!res.ok) throw new Error(await getApiErrorMessage(res));
+  return res.json();
+}
+
+export async function fetchChannelAccounts(type?: ChannelAccountType): Promise<ChannelAccountRecord[]> {
+  const params = new URLSearchParams();
+  if (type) params.set("type", type);
+  const suffix = params.size > 0 ? `?${params.toString()}` : "";
+  const res = await fetch(`${API_BASE}/channels/accounts${suffix}`, { headers: await getAuthHeaders() });
+  if (!res.ok) throw new Error(await getApiErrorMessage(res));
+  const data = await res.json() as { accounts?: ChannelAccountRecord[] };
+  return data.accounts ?? [];
+}
+
+export async function createChannelAccount(payload: {
+  type: ChannelAccountType;
+  name: string;
+  metadata?: Record<string, unknown> | null;
+}) {
+  const res = await fetch(`${API_BASE}/channels/accounts`, {
+    method: "POST",
+    headers: await getAuthHeaders(),
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error(await getApiErrorMessage(res));
+  const data = await res.json() as { account: ChannelAccountRecord };
+  return data.account;
+}
+
+export async function updateChannelAccount(id: number, payload: {
+  name?: string;
+  metadata?: Record<string, unknown> | null;
+}) {
+  const res = await fetch(`${API_BASE}/channels/accounts/${id}`, {
+    method: "PATCH",
+    headers: await getAuthHeaders(),
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error(await getApiErrorMessage(res));
+  const data = await res.json() as { account: ChannelAccountRecord };
+  return data.account;
+}
+
+export async function deleteChannelAccount(id: number) {
+  const res = await fetch(`${API_BASE}/channels/accounts/${id}`, {
+    method: "DELETE",
+    headers: await getAuthHeaders(),
+  });
+  if (!res.ok) throw new Error(await getApiErrorMessage(res));
+  return res.json() as Promise<{ deleted: boolean }>;
+}
+
+export async function fetchChannels(accountId: number): Promise<ChannelRecord[]> {
+  const res = await fetch(`${API_BASE}/channels/accounts/${accountId}/channels`, {
+    headers: await getAuthHeaders(),
+  });
+  if (!res.ok) throw new Error(await getApiErrorMessage(res));
+  const data = await res.json() as { channels?: ChannelRecord[] };
+  return data.channels ?? [];
+}
+
+export async function createChannel(accountId: number, payload: {
+  name: string;
+  displayName?: string | null;
+  icon?: string | null;
+  settings?: Record<string, unknown> | null;
+}) {
+  const res = await fetch(`${API_BASE}/channels/accounts/${accountId}/channels`, {
+    method: "POST",
+    headers: await getAuthHeaders(),
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error(await getApiErrorMessage(res));
+  const data = await res.json() as { channel: ChannelRecord };
+  return data.channel;
+}
+
+export async function updateChannel(id: number, payload: {
+  name?: string;
+  displayName?: string | null;
+  icon?: string | null;
+  settings?: Record<string, unknown> | null;
+}) {
+  const res = await fetch(`${API_BASE}/channels/${id}`, {
+    method: "PATCH",
+    headers: await getAuthHeaders(),
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error(await getApiErrorMessage(res));
+  const data = await res.json() as { channel: ChannelRecord };
+  return data.channel;
+}
+
+export async function deleteChannel(id: number) {
+  const res = await fetch(`${API_BASE}/channels/${id}`, {
+    method: "DELETE",
+    headers: await getAuthHeaders(),
+  });
+  if (!res.ok) throw new Error(await getApiErrorMessage(res));
+  return res.json() as Promise<{ deleted: boolean }>;
+}
+
+export async function fetchChannelInbox(channelId: number, options?: {
+  limit?: number;
+  beforeId?: number;
+}): Promise<ChannelInboxState> {
+  const params = new URLSearchParams();
+  if (options?.limit) params.set("limit", String(options.limit));
+  if (options?.beforeId) params.set("beforeId", String(options.beforeId));
+  const suffix = params.size > 0 ? `?${params.toString()}` : "";
+  const res = await fetch(`${API_BASE}/channels/${channelId}/inbox${suffix}`, {
+    headers: await getAuthHeaders(),
+  });
+  if (!res.ok) throw new Error(await getApiErrorMessage(res));
+  return res.json();
+}
+
 export async function createMcpServer(payload: {
   name: string;
   config: McpServerConfigRecord;
@@ -379,6 +778,15 @@ export async function deleteMcpServer(name: string) {
   });
   if (!res.ok) throw new Error(await getApiErrorMessage(res));
   return res.json() as Promise<Omit<McpServerMutationResponse, "server">>;
+}
+
+export async function discoverMcpServer(name: string) {
+  const res = await fetch(`${API_BASE}/mcp/${encodeURIComponent(name)}/discover`, {
+    method: "POST",
+    headers: await getAuthHeaders(),
+  });
+  if (!res.ok) throw new Error(await getApiErrorMessage(res));
+  return res.json() as Promise<McpServerDiscoveryResponse>;
 }
 
 export async function fetchProjects(): Promise<ProjectRecord[]> {
@@ -487,7 +895,8 @@ export async function fetchAgents(projectId?: number): Promise<AgentRecord[]> {
   const query = projectId ? `?projectId=${projectId}` : "";
   const res = await fetch(`${API_BASE}/control/agents${query}`, { headers: await getAuthHeaders() });
   if (!res.ok) throw new Error(`API error: ${res.status}`);
-  return res.json();
+  const data = await res.json() as AgentRecord[];
+  return data.map(normalizeAgentRecord);
 }
 
 export async function createAgent(payload: {
@@ -499,6 +908,9 @@ export async function createAgent(payload: {
   defaultPrompt?: string;
   heartbeatPrompt?: string;
   heartbeatIntervalSeconds?: number | null;
+  toolProfile?: ToolProfile;
+  allowedCapabilityFamilies?: CapabilityFamily[];
+  blockedCapabilityFamilies?: CapabilityFamily[];
   automationEnabled?: boolean;
   status?: string;
 }) {
@@ -508,7 +920,8 @@ export async function createAgent(payload: {
     body: JSON.stringify(payload),
   });
   if (!res.ok) throw new Error(`API error: ${res.status}`);
-  return res.json() as Promise<AgentRecord>;
+  const data = await res.json() as AgentRecord;
+  return normalizeAgentRecord(data);
 }
 
 export async function updateAgent(id: number, payload: {
@@ -520,6 +933,9 @@ export async function updateAgent(id: number, payload: {
   defaultPrompt?: string;
   heartbeatPrompt?: string;
   heartbeatIntervalSeconds?: number | null;
+  toolProfile?: ToolProfile;
+  allowedCapabilityFamilies?: CapabilityFamily[];
+  blockedCapabilityFamilies?: CapabilityFamily[];
   automationEnabled?: boolean;
   status?: string;
 }) {
@@ -529,7 +945,8 @@ export async function updateAgent(id: number, payload: {
     body: JSON.stringify(payload),
   });
   if (!res.ok) throw new Error(`API error: ${res.status}`);
-  return res.json() as Promise<AgentRecord>;
+  const data = await res.json() as AgentRecord;
+  return normalizeAgentRecord(data);
 }
 
 export async function deleteAgent(id: number) {
@@ -570,6 +987,90 @@ export async function sendAgentChatMessage(agentId: number, message: string) {
     reply: AgentChatMessage;
     history: AgentChatMessage[];
   }>;
+}
+
+export async function fetchNativeSessionChatState(sessionName: string, limit = 100): Promise<NativeSessionChatState> {
+  const res = await fetch(`${API_BASE}/native-sessions/${encodeURIComponent(sessionName)}/chat?limit=${limit}`, {
+    headers: await getAuthHeaders(),
+  });
+  if (!res.ok) throw new Error(await getApiErrorMessage(res));
+  return res.json();
+}
+
+export async function sendNativeSessionChatMessage(sessionName: string, message: string) {
+  const res = await fetch(`${API_BASE}/native-sessions/${encodeURIComponent(sessionName)}/chat`, {
+    method: "POST",
+    headers: await getAuthHeaders(),
+    body: JSON.stringify({ message }),
+  });
+  if (!res.ok) throw new Error(await getApiErrorMessage(res));
+  return res.json() as Promise<{
+    session: Worker;
+    reply: NativeSessionChatMessage;
+    history: NativeSessionChatMessage[];
+  }>;
+}
+
+export async function fetchAgentMemories(agentId: number): Promise<ScopedMemoryRecord[]> {
+  const res = await fetch(`${API_BASE}/control/agents/${agentId}/memory`, {
+    headers: await getAuthHeaders(),
+  });
+  if (!res.ok) throw new Error(await getApiErrorMessage(res));
+  return res.json();
+}
+
+export async function createAgentMemory(agentId: number, payload: {
+  category: ScopedMemoryRecord["category"];
+  content: string;
+  source?: "user" | "auto";
+}) {
+  const res = await fetch(`${API_BASE}/control/agents/${agentId}/memory`, {
+    method: "POST",
+    headers: await getAuthHeaders(),
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error(await getApiErrorMessage(res));
+  return res.json();
+}
+
+export async function deleteAgentMemory(agentId: number, memoryId: number) {
+  const res = await fetch(`${API_BASE}/control/agents/${agentId}/memory/${memoryId}`, {
+    method: "DELETE",
+    headers: await getAuthHeaders(),
+  });
+  if (!res.ok) throw new Error(await getApiErrorMessage(res));
+  return res.json() as Promise<{ ok: boolean; removed: boolean }>;
+}
+
+export async function fetchNativeSessionMemories(sessionName: string): Promise<ScopedMemoryRecord[]> {
+  const res = await fetch(`${API_BASE}/native-sessions/${encodeURIComponent(sessionName)}/memory`, {
+    headers: await getAuthHeaders(),
+  });
+  if (!res.ok) throw new Error(await getApiErrorMessage(res));
+  return res.json();
+}
+
+export async function createNativeSessionMemory(sessionName: string, payload: {
+  category: ScopedMemoryRecord["category"];
+  content: string;
+  source?: "user" | "auto";
+}) {
+  const res = await fetch(`${API_BASE}/native-sessions/${encodeURIComponent(sessionName)}/memory`, {
+    method: "POST",
+    headers: await getAuthHeaders(),
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error(await getApiErrorMessage(res));
+  return res.json();
+}
+
+export async function deleteNativeSessionMemory(sessionName: string, memoryId: number) {
+  const res = await fetch(`${API_BASE}/native-sessions/${encodeURIComponent(sessionName)}/memory/${memoryId}`, {
+    method: "DELETE",
+    headers: await getAuthHeaders(),
+  });
+  if (!res.ok) throw new Error(await getApiErrorMessage(res));
+  return res.json() as Promise<{ ok: boolean; removed: boolean }>;
 }
 
 export async function fetchSchedules(projectId?: number): Promise<ScheduleRecord[]> {

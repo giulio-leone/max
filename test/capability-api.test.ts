@@ -5,7 +5,7 @@ import { join } from "path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const hoisted = vi.hoisted(() => {
-  const tempHome = `/tmp/max-mcp-api-${Math.random().toString(36).slice(2)}`;
+  const tempHome = `/tmp/max-capabilities-api-${Math.random().toString(36).slice(2)}`;
   const apiToken = "test-token";
   const apiTokenPath = `${tempHome}/api-token`;
 
@@ -13,11 +13,13 @@ const hoisted = vi.hoisted(() => {
     tempHome,
     apiToken,
     apiTokenPath,
+    skillMocks: {
+      listSkills: vi.fn(),
+    },
     mcpMocks: {
-      createMcpServer: vi.fn(),
+      loadMcpConfig: vi.fn(),
+      loadMaxMcpConfig: vi.fn(),
       readMcpConfig: vi.fn(),
-      removeMcpServer: vi.fn(),
-      updateMcpServer: vi.fn(),
     },
   };
 });
@@ -127,17 +129,19 @@ vi.mock("../src/copilot/harness.js", () => ({
 
 vi.mock("../src/copilot/skills.js", () => ({
   createSkill: vi.fn(),
-  listSkills: vi.fn(() => []),
+  listSkills: hoisted.skillMocks.listSkills,
   readSkill: vi.fn(),
   removeSkill: vi.fn(),
   updateSkill: vi.fn(),
 }));
 
 vi.mock("../src/copilot/mcp-config.js", () => ({
-  createMcpServer: hoisted.mcpMocks.createMcpServer,
+  createMcpServer: vi.fn(),
+  loadMcpConfig: hoisted.mcpMocks.loadMcpConfig,
+  loadMaxMcpConfig: hoisted.mcpMocks.loadMaxMcpConfig,
   readMcpConfig: hoisted.mcpMocks.readMcpConfig,
-  removeMcpServer: hoisted.mcpMocks.removeMcpServer,
-  updateMcpServer: hoisted.mcpMocks.updateMcpServer,
+  removeMcpServer: vi.fn(),
+  updateMcpServer: vi.fn(),
 }));
 
 vi.mock("../src/copilot/worker-sessions.js", () => ({
@@ -154,9 +158,7 @@ vi.mock("../src/copilot/worker-sessions.js", () => ({
   updateManagedSessionMetadata: vi.fn(),
 }));
 
-const configPath = join(hoisted.tempHome, ".copilot", "mcp-config.json");
-
-describe("MCP API routes", () => {
+describe("capability registry API", () => {
   let server: Server;
   let baseUrl = "";
 
@@ -171,60 +173,70 @@ describe("MCP API routes", () => {
   });
 
   afterAll(async () => {
-    await new Promise<void>((resolve, reject) => {
-      server.close((err) => {
-        if (err) reject(err);
-        else resolve();
+    if (server) {
+      await new Promise<void>((resolve, reject) => {
+        server.close((err) => {
+          if (err) reject(err);
+          else resolve();
+        });
       });
-    });
+    }
     rmSync(hoisted.tempHome, { recursive: true, force: true });
   });
 
   beforeEach(() => {
     vi.clearAllMocks();
+    hoisted.skillMocks.listSkills.mockReturnValue([
+      {
+        slug: "browser-check",
+        name: "Browser Check",
+        description: "Inspect a browser page and summarize issues.",
+        directory: join(hoisted.tempHome, "skills", "browser-check"),
+        source: "local",
+      },
+    ]);
     hoisted.mcpMocks.readMcpConfig.mockReturnValue({
       ok: true,
-      message: `Loaded MCP config from ${configPath}.`,
-      configPath,
+      message: "Loaded MCP config.",
+      configPath: join(hoisted.tempHome, ".copilot", "mcp-config.json"),
       document: {
         mcpServers: {
-          zebra: {
-            type: "sse",
-            url: "http://127.0.0.1:9999/sse",
-            tools: ["read_page"],
-          },
-          alpha: {
+          playwright: {
             command: "npx",
-            args: ["-y", "alpha-server"],
-            tools: ["*"],
+            args: ["-y", "playwright-mcp"],
+            tools: ["browser_open", "browser_click"],
+          },
+          unknown: {
+            command: "npx",
+            args: ["-y", "unknown-mcp"],
+            tools: ["alpha_tool"],
           },
         },
       },
     });
-    hoisted.mcpMocks.createMcpServer.mockReturnValue({
-      ok: true,
-      message: "MCP server 'browser' created.",
-      configPath,
-      server: {
+    hoisted.mcpMocks.loadMcpConfig.mockReturnValue({
+      playwright: {
         command: "npx",
-        args: ["-y", "browser-server"],
-        tools: ["*"],
+        args: ["-y", "playwright-mcp"],
+        tools: ["browser_open", "browser_click"],
+      },
+      unknown: {
+        command: "npx",
+        args: ["-y", "unknown-mcp"],
+        tools: ["alpha_tool"],
       },
     });
-    hoisted.mcpMocks.updateMcpServer.mockReturnValue({
-      ok: true,
-      message: "MCP server 'alpha' updated.",
-      configPath,
-      server: {
-        type: "http",
-        url: "http://127.0.0.1:8080/mcp",
-        tools: ["tool_a"],
+    hoisted.mcpMocks.loadMaxMcpConfig.mockReturnValue({
+      playwright: {
+        command: "npx",
+        args: ["-y", "playwright-mcp"],
+        tools: ["browser_open", "browser_click"],
       },
-    });
-    hoisted.mcpMocks.removeMcpServer.mockReturnValue({
-      ok: true,
-      message: "MCP server 'alpha' removed.",
-      configPath,
+      unknown: {
+        command: "npx",
+        args: ["-y", "unknown-mcp"],
+        tools: ["alpha_tool"],
+      },
     });
   });
 
@@ -237,82 +249,77 @@ describe("MCP API routes", () => {
     });
   }
 
-  it("returns the MCP server list from GET /mcp", async () => {
-    const response = await apiFetch("/mcp");
+  it("returns the full capability registry from GET /capabilities", async () => {
+    const response = await apiFetch("/capabilities");
     const json = await response.json() as {
-      configPath: string;
-      servers: Array<{ name: string; config: Record<string, unknown> }>;
+      totals: { capabilities: number; unclassified: number };
+      families: Array<{ id: string; capabilities: Array<{ id: string }> }>;
     };
 
     expect(response.status).toBe(200);
-    expect(json.configPath).toBe(configPath);
-    expect(json.servers.map((server) => server.name)).toEqual(["alpha", "zebra"]);
+    expect(json.totals.capabilities).toBeGreaterThan(0);
+    expect(json.totals.unclassified).toBe(1);
+    expect(json.families.find((family) => family.id === "browser")?.capabilities).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: "skill:browser-check:local" }),
+        expect.objectContaining({ id: "mcp:playwright" }),
+      ]),
+    );
   });
 
-  it("creates an MCP server through POST /mcp", async () => {
-    const payload = {
-      name: "browser",
-      config: {
-        command: "npx",
-        args: ["-y", "browser-server"],
-        tools: ["*"],
-      },
-    };
-
-    const response = await apiFetch("/mcp", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
+  it("filters the registry by family and query", async () => {
+    const response = await apiFetch("/capabilities?family=browser&q=playwright");
     const json = await response.json() as {
-      ok: boolean;
-      serverName: string;
-      configPath: string;
-    };
-
-    expect(response.status).toBe(201);
-    expect(json.ok).toBe(true);
-    expect(json.serverName).toBe("browser");
-    expect(hoisted.mcpMocks.createMcpServer).toHaveBeenCalledWith("browser", expect.objectContaining(payload.config));
-  });
-
-  it("updates an MCP server through PUT /mcp/:name", async () => {
-    const payload = {
-      config: {
-        type: "http",
-        url: "http://127.0.0.1:8080/mcp",
-        tools: ["tool_a"],
-      },
-    };
-
-    const response = await apiFetch("/mcp/alpha", {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    const json = await response.json() as {
-      ok: boolean;
-      serverName: string;
+      families: Array<{ id: string; capabilities: Array<{ id: string }> }>;
     };
 
     expect(response.status).toBe(200);
-    expect(json.ok).toBe(true);
-    expect(json.serverName).toBe("alpha");
-    expect(hoisted.mcpMocks.updateMcpServer).toHaveBeenCalledWith("alpha", expect.objectContaining(payload.config));
+    expect(json.families).toHaveLength(1);
+    expect(json.families[0].id).toBe("browser");
+    expect(json.families[0].capabilities).toEqual([
+      expect.objectContaining({ id: "mcp:playwright" }),
+    ]);
   });
 
-  it("removes an MCP server through DELETE /mcp/:name", async () => {
-    const response = await apiFetch("/mcp/alpha", {
-      method: "DELETE",
-    });
+  it("rejects unknown families", async () => {
+    const response = await apiFetch("/capabilities?family=unknown");
+    const json = await response.json() as { error?: string };
+
+    expect(response.status).toBe(400);
+    expect(json.error).toContain("Invalid capability family");
+  });
+
+  it("returns the runtime adapter registry from GET /capability-adapters", async () => {
+    const response = await apiFetch("/capability-adapters");
     const json = await response.json() as {
-      ok: boolean;
-      serverName: string;
+      totals: { adapters: number; unclassified: number };
+      adapters: Array<{ id: string; family: string | null; sourceType: string }>;
     };
 
     expect(response.status).toBe(200);
-    expect(json.ok).toBe(true);
-    expect(json.serverName).toBe("alpha");
-    expect(hoisted.mcpMocks.removeMcpServer).toHaveBeenCalledWith("alpha");
+    expect(json.totals.adapters).toBeGreaterThan(0);
+    expect(json.totals.unclassified).toBe(1);
+    expect(json.adapters).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: "skill:browser-check:local", family: "browser", sourceType: "skill" }),
+        expect.objectContaining({ id: "mcp:playwright", family: "browser", sourceType: "mcp" }),
+      ]),
+    );
+  });
+
+  it("filters runtime adapters by family and query", async () => {
+    const response = await apiFetch("/capability-adapters?family=browser&q=browser");
+    const json = await response.json() as {
+      adapters: Array<{ id: string; family: string | null }>;
+    };
+
+    expect(response.status).toBe(200);
+    expect(json.adapters).toHaveLength(2);
+    expect(json.adapters).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: "skill:browser-check:local", family: "browser" }),
+        expect.objectContaining({ id: "mcp:playwright", family: "browser" }),
+      ]),
+    );
   });
 });

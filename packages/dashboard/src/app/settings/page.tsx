@@ -2,16 +2,24 @@
 
 import { type ReactNode, useCallback, useEffect, useMemo, useState } from "react";
 import {
+  fetchCapabilityAdapters,
+  fetchCapabilityRegistry,
   createSkill,
   createMcpServer,
   deleteSkill,
   deleteMcpServer,
+  discoverMcpServer,
   fetchSkill,
   fetchSkills,
   fetchMcpServers,
   setStoredApiToken,
   updateMcpServer,
   updateSkill,
+  type CapabilityAdapterRegistry,
+  type CapabilityFamily,
+  type CapabilityFamilyGroup,
+  type CapabilityRegistry,
+  type CapabilitySource,
   type McpServerConfigRecord,
   type McpServerEntry,
   type SkillDetail,
@@ -49,6 +57,7 @@ function createDefaultMcpJson() {
     command: "npx",
     args: ["-y", "example-mcp-server"],
     tools: ["*"],
+    eagerDiscovery: false,
   }, null, 2);
 }
 
@@ -80,8 +89,25 @@ function sourceBadgeClassName(source: SkillSource) {
   return "bg-[rgba(245,158,11,0.15)] text-[#fbbf24] border-[rgba(245,158,11,0.35)]";
 }
 
+function capabilitySourceBadgeClassName(source: CapabilitySource) {
+  if (source === "builtin") return "bg-[rgba(99,102,241,0.15)] text-[#a5b4fc] border-[rgba(99,102,241,0.35)]";
+  if (source === "skill") return "bg-[rgba(16,185,129,0.15)] text-[#34d399] border-[rgba(16,185,129,0.35)]";
+  return "bg-[rgba(245,158,11,0.15)] text-[#fbbf24] border-[rgba(245,158,11,0.35)]";
+}
+
 function formatSourceLabel(source: SkillSource) {
   return source.charAt(0).toUpperCase() + source.slice(1);
+}
+
+function formatCapabilitySourceLabel(source: CapabilitySource) {
+  if (source === "builtin") return "Built-in";
+  if (source === "skill") return "Skill";
+  return "MCP";
+}
+
+function formatCapabilityFamilyLabel(family: CapabilityFamily | null) {
+  if (!family) return "Unclassified";
+  return family.charAt(0).toUpperCase() + family.slice(1);
 }
 
 function formatMcpTransport(config: McpServerConfigRecord) {
@@ -101,6 +127,11 @@ function describeMcpServer(config: McpServerConfigRecord) {
     return [config.command, args].filter(Boolean).join(" ");
   }
   return "No command or URL configured";
+}
+
+function formatTimestamp(value?: string) {
+  if (!value) return "—";
+  return new Date(value).toLocaleString();
 }
 
 function Field({
@@ -131,11 +162,26 @@ function SourceBadge({ source }: { source: SkillSource }) {
   );
 }
 
+function CapabilitySourceBadge({ source }: { source: CapabilitySource }) {
+  return (
+    <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium ${capabilitySourceBadgeClassName(source)}`}>
+      {formatCapabilitySourceLabel(source)}
+    </span>
+  );
+}
+
 export default function SettingsPage() {
   const [token, setToken] = useState(() =>
     typeof window !== "undefined" ? localStorage.getItem("max-api-token") ?? "" : ""
   );
   const [saved, setSaved] = useState(false);
+  const [capabilityRegistry, setCapabilityRegistry] = useState<CapabilityRegistry | null>(null);
+  const [capabilityAdapters, setCapabilityAdapters] = useState<CapabilityAdapterRegistry | null>(null);
+  const [selectedCapabilityFamily, setSelectedCapabilityFamily] = useState<CapabilityFamily>("sessions");
+  const [loadingCapabilities, setLoadingCapabilities] = useState(true);
+  const [capabilitiesError, setCapabilitiesError] = useState<string | null>(null);
+  const [loadingCapabilityAdapters, setLoadingCapabilityAdapters] = useState(true);
+  const [capabilityAdaptersError, setCapabilityAdaptersError] = useState<string | null>(null);
 
   const [skills, setSkills] = useState<SkillSummary[]>([]);
   const [selectedSlug, setSelectedSlug] = useState<string | null>(null);
@@ -157,7 +203,7 @@ export default function SettingsPage() {
     json: createDefaultMcpJson(),
   });
   const [loadingMcp, setLoadingMcp] = useState(true);
-  const [mcpSubmitting, setMcpSubmitting] = useState<"create" | "update" | "delete" | null>(null);
+  const [mcpSubmitting, setMcpSubmitting] = useState<"create" | "update" | "delete" | "discover" | null>(null);
   const [mcpError, setMcpError] = useState<string | null>(null);
   const [mcpNotice, setMcpNotice] = useState<string | null>(null);
 
@@ -168,6 +214,39 @@ export default function SettingsPage() {
       setToken((current) => current || stored);
     }
   }, []);
+
+  const loadCapabilityRegistry = useCallback(async () => {
+    setLoadingCapabilities(true);
+    try {
+      const registry = await fetchCapabilityRegistry();
+      setCapabilityRegistry(registry);
+      setCapabilitiesError(null);
+      syncTokenFromStorage();
+      setSelectedCapabilityFamily((current) => (
+        registry.families.some((family) => family.id === current)
+          ? current
+          : registry.families[0]?.id ?? "sessions"
+      ));
+    } catch (err) {
+      setCapabilitiesError(err instanceof Error ? err.message : "Failed to load capability registry");
+    } finally {
+      setLoadingCapabilities(false);
+    }
+  }, [syncTokenFromStorage]);
+
+  const loadCapabilityAdapters = useCallback(async () => {
+    setLoadingCapabilityAdapters(true);
+    try {
+      const registry = await fetchCapabilityAdapters();
+      setCapabilityAdapters(registry);
+      setCapabilityAdaptersError(null);
+      syncTokenFromStorage();
+    } catch (err) {
+      setCapabilityAdaptersError(err instanceof Error ? err.message : "Failed to load capability adapters");
+    } finally {
+      setLoadingCapabilityAdapters(false);
+    }
+  }, [syncTokenFromStorage]);
 
   const loadSkillsList = useCallback(async (preferredSlug?: string | null) => {
     setLoadingSkills(true);
@@ -209,6 +288,14 @@ export default function SettingsPage() {
       setLoadingMcp(false);
     }
   }, [syncTokenFromStorage]);
+
+  useEffect(() => {
+    void loadCapabilityRegistry();
+  }, [loadCapabilityRegistry]);
+
+  useEffect(() => {
+    void loadCapabilityAdapters();
+  }, [loadCapabilityAdapters]);
 
   useEffect(() => {
     void loadSkillsList();
@@ -300,6 +387,27 @@ export default function SettingsPage() {
     () => aggregatedSkills.find((skill) => skill.slug === selectedSlug) ?? null,
     [aggregatedSkills, selectedSlug]
   );
+  const selectedCapabilityGroup = useMemo<CapabilityFamilyGroup | null>(
+    () => capabilityRegistry?.families.find((family) => family.id === selectedCapabilityFamily)
+      ?? capabilityRegistry?.families[0]
+      ?? null,
+    [capabilityRegistry, selectedCapabilityFamily]
+  );
+  const selectedCapabilityAdapters = useMemo(
+    () => capabilityAdapters?.adapters.filter((adapter) => adapter.family === selectedCapabilityFamily) ?? [],
+    [capabilityAdapters, selectedCapabilityFamily]
+  );
+  const unclassifiedCapabilityAdapters = useMemo(
+    () => capabilityAdapters?.adapters.filter((adapter) => adapter.family === null) ?? [],
+    [capabilityAdapters]
+  );
+  const unclassifiedCapabilityNames = useMemo(() => {
+    if (!capabilityRegistry) return [];
+    return [
+      ...capabilityRegistry.unclassified.skills.map((entry) => entry.name),
+      ...capabilityRegistry.unclassified.mcpServers.map((entry) => entry.name),
+    ].slice(0, 6);
+  }, [capabilityRegistry]);
   const selectedMcpEntry = useMemo(
     () => mcpServers.find((server) => server.name === selectedMcpName) ?? null,
     [mcpServers, selectedMcpName]
@@ -363,6 +471,9 @@ export default function SettingsPage() {
     setSaved(true);
     setTimeout(() => setSaved(false), 2000);
     void loadSkillsList(selectedSlug);
+    void loadCapabilityRegistry();
+    void loadCapabilityAdapters();
+    void loadMcpServerList(selectedMcpName);
   };
 
   async function handleSkillSubmit() {
@@ -392,7 +503,11 @@ export default function SettingsPage() {
         });
 
       setSkillNotice(result.message);
-      await loadSkillsList(result.skill.slug);
+      await Promise.all([
+        loadSkillsList(result.skill.slug),
+        loadCapabilityRegistry(),
+        loadCapabilityAdapters(),
+      ]);
     } catch (err) {
       setSkillsError(err instanceof Error ? err.message : "Failed to save skill");
     } finally {
@@ -410,7 +525,11 @@ export default function SettingsPage() {
     try {
       const result = await deleteSkill(selectedSkill.slug);
       setSkillNotice(result.message);
-      await loadSkillsList(selectedSkill.slug);
+      await Promise.all([
+        loadSkillsList(selectedSkill.slug),
+        loadCapabilityRegistry(),
+        loadCapabilityAdapters(),
+      ]);
     } catch (err) {
       setSkillsError(err instanceof Error ? err.message : "Failed to delete skill");
     } finally {
@@ -448,7 +567,11 @@ export default function SettingsPage() {
         : await updateMcpServer(selectedMcpName ?? serverName, { config: parsedConfig as McpServerConfigRecord });
 
       setMcpNotice(result.message);
-      await loadMcpServerList(result.serverName);
+      await Promise.all([
+        loadMcpServerList(result.serverName),
+        loadCapabilityRegistry(),
+        loadCapabilityAdapters(),
+      ]);
     } catch (err) {
       setMcpError(err instanceof Error ? err.message : "Failed to save MCP server");
     } finally {
@@ -466,9 +589,37 @@ export default function SettingsPage() {
     try {
       const result = await deleteMcpServer(selectedMcpName);
       setMcpNotice(result.message);
-      await loadMcpServerList();
+      await Promise.all([
+        loadMcpServerList(),
+        loadCapabilityRegistry(),
+        loadCapabilityAdapters(),
+      ]);
     } catch (err) {
       setMcpError(err instanceof Error ? err.message : "Failed to delete MCP server");
+    } finally {
+      setMcpSubmitting(null);
+    }
+  }
+
+  async function handleDiscoverMcpServer() {
+    if (!selectedMcpEntry) return;
+
+    setMcpSubmitting("discover");
+    resetMcpNoticeState();
+
+    try {
+      const result = await discoverMcpServer(selectedMcpEntry.name);
+      const toolSummary = result.discoveredTools.length === 0
+        ? "No tools reported."
+        : `${result.discoveredTools.length} tool${result.discoveredTools.length === 1 ? "" : "s"} discovered.`;
+      setMcpNotice(`${result.message} ${toolSummary}`);
+      await Promise.all([
+        loadMcpServerList(result.serverName),
+        loadCapabilityRegistry(),
+        loadCapabilityAdapters(),
+      ]);
+    } catch (err) {
+      setMcpError(err instanceof Error ? err.message : "Failed to discover MCP tools");
     } finally {
       setMcpSubmitting(null);
     }
@@ -532,6 +683,341 @@ export default function SettingsPage() {
           </div>
         </section>
       </div>
+
+      <section className={cardClassName()}>
+        <div className="px-4 py-3 border-b border-[var(--border)] flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+          <div>
+            <h3 className="text-sm font-medium text-[var(--text-muted)]">Capability Registry</h3>
+            <p className="text-xs text-[var(--text-muted)] mt-1">
+              Max-owned map of the current OpenClaw-style capability families across built-ins, skills, and MCP servers.
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            {capabilityRegistry && (
+              <span className="text-xs text-[var(--text-muted)]">
+                {capabilityRegistry.totals.capabilities} mapped capabilities across {capabilityRegistry.totals.populatedFamilies}/{capabilityRegistry.totals.families} families
+              </span>
+            )}
+            <button
+              onClick={() => void loadCapabilityRegistry()}
+              className={buttonClassName()}
+              disabled={loadingCapabilities}
+            >
+              {loadingCapabilities ? "Refreshing..." : "Refresh"}
+            </button>
+          </div>
+        </div>
+
+        <div className="p-4 md:p-6 space-y-4">
+          {capabilitiesError && (
+            <div className="rounded-lg bg-[rgba(239,68,68,0.15)] border border-[var(--danger)] p-3 text-sm text-[var(--danger)]">
+              {capabilitiesError}
+            </div>
+          )}
+
+          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3">
+            {(capabilityRegistry?.families ?? []).map((family) => {
+              const selected = selectedCapabilityGroup?.id === family.id;
+              return (
+                <button
+                  key={family.id}
+                  onClick={() => setSelectedCapabilityFamily(family.id)}
+                  className={`rounded-xl border p-4 text-left transition-colors ${
+                    selected
+                      ? "border-[var(--accent)] bg-[rgba(99,102,241,0.12)]"
+                      : "border-[var(--border)] hover:border-[var(--accent)]"
+                  }`}
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <p className="text-sm font-semibold text-[var(--text)]">{family.label}</p>
+                      <p className="text-xs text-[var(--text-muted)] mt-1">{family.description}</p>
+                    </div>
+                    <span className="inline-flex items-center rounded-full border border-[var(--border)] px-2 py-0.5 text-[11px] font-medium text-[var(--text-muted)]">
+                      {family.availableCount}
+                    </span>
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+
+          {loadingCapabilities && !capabilityRegistry ? (
+            <div className="rounded-lg border border-dashed border-[var(--border)] p-6 text-sm text-[var(--text-muted)]">
+              Loading capability registry…
+            </div>
+          ) : selectedCapabilityGroup ? (
+            <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_320px] gap-4">
+              <div className="space-y-3">
+                <div className="rounded-xl border border-[var(--border)] bg-[var(--bg)] p-4">
+                  <div className="flex flex-col gap-2 md:flex-row md:items-start md:justify-between">
+                    <div>
+                      <h4 className="text-lg font-semibold">{selectedCapabilityGroup.label}</h4>
+                      <p className="text-sm text-[var(--text-muted)] mt-1">{selectedCapabilityGroup.description}</p>
+                    </div>
+                    <div className="text-xs text-[var(--text-muted)]">
+                      {selectedCapabilityGroup.availableCount} available / {selectedCapabilityGroup.capabilityCount} mapped
+                    </div>
+                  </div>
+                </div>
+
+                {selectedCapabilityGroup.capabilities.length > 0 ? (
+                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+                    {selectedCapabilityGroup.capabilities.map((capability) => (
+                      <div
+                        key={capability.id}
+                        className="rounded-xl border border-[var(--border)] bg-[var(--bg)] p-4 space-y-3"
+                      >
+                        <div className="flex items-start justify-between gap-3">
+                          <div>
+                            <h5 className="text-sm font-semibold text-[var(--text)]">{capability.name}</h5>
+                            <p className="text-xs text-[var(--text-muted)] mt-1">{capability.description}</p>
+                          </div>
+                          <CapabilitySourceBadge source={capability.sourceType} />
+                        </div>
+
+                        <div className="flex flex-wrap gap-2 text-[11px] text-[var(--text-muted)]">
+                          <span className="inline-flex items-center rounded-full border border-[var(--border)] px-2 py-0.5">
+                            Source: {capability.sourceName}
+                          </span>
+                          <span className="inline-flex items-center rounded-full border border-[var(--border)] px-2 py-0.5">
+                            {capability.available ? "Available" : "Unavailable"}
+                          </span>
+                        </div>
+
+                        <div className="space-y-2">
+                          <div>
+                            <p className="text-[11px] uppercase tracking-wide text-[var(--text-muted)]">Tools</p>
+                            <div className="flex flex-wrap gap-1.5 mt-1.5">
+                              {capability.tools.length > 0 ? capability.tools.map((tool) => (
+                                <code
+                                  key={`${capability.id}-${tool}`}
+                                  className="px-1.5 py-0.5 rounded bg-[var(--bg-card)] text-[var(--accent)] text-[11px]"
+                                >
+                                  {tool}
+                                </code>
+                              )) : (
+                                <span className="text-xs text-[var(--text-muted)]">No direct tool names exposed here.</span>
+                              )}
+                            </div>
+                          </div>
+
+                          <div>
+                            <p className="text-[11px] uppercase tracking-wide text-[var(--text-muted)]">Surfaces</p>
+                            <div className="flex flex-wrap gap-1.5 mt-1.5">
+                              {capability.surfaces.map((surface) => (
+                                <code
+                                  key={`${capability.id}-${surface}`}
+                                  className="px-1.5 py-0.5 rounded bg-[var(--bg-card)] text-[var(--text-muted)] text-[11px]"
+                                >
+                                  {surface}
+                                </code>
+                              ))}
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="rounded-lg border border-dashed border-[var(--border)] p-6 text-sm text-[var(--text-muted)]">
+                    No mapped capabilities yet for this family. Add a matching skill or MCP server, or extend Max-owned abstractions to populate it.
+                  </div>
+                )}
+              </div>
+
+              <aside className="rounded-xl border border-[var(--border)] bg-[var(--bg)] p-4 space-y-3">
+                <div>
+                  <h4 className="text-sm font-semibold">Registry Notes</h4>
+                  <p className="text-xs text-[var(--text-muted)] mt-1">
+                    This registry is additive and read-only for now: it maps current built-ins plus inferred skill/MCP coverage without mutating your configured servers or skill files.
+                  </p>
+                </div>
+
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="rounded-lg border border-[var(--border)] p-3">
+                    <p className="text-[11px] uppercase tracking-wide text-[var(--text-muted)]">Mapped</p>
+                    <p className="text-xl font-semibold mt-1">{capabilityRegistry?.totals.capabilities ?? 0}</p>
+                  </div>
+                  <div className="rounded-lg border border-[var(--border)] p-3">
+                    <p className="text-[11px] uppercase tracking-wide text-[var(--text-muted)]">Unclassified</p>
+                    <p className="text-xl font-semibold mt-1">{capabilityRegistry?.totals.unclassified ?? 0}</p>
+                  </div>
+                </div>
+
+                {capabilityRegistry && capabilityRegistry.totals.unclassified > 0 && (
+                  <div className="rounded-lg border border-[var(--border)] p-3">
+                    <p className="text-[11px] uppercase tracking-wide text-[var(--text-muted)]">Still unclassified</p>
+                    <p className="text-xs text-[var(--text-muted)] mt-2">
+                      {unclassifiedCapabilityNames.join(", ")}
+                      {capabilityRegistry.totals.unclassified > unclassifiedCapabilityNames.length ? "..." : ""}
+                    </p>
+                  </div>
+                )}
+
+                <div className="rounded-lg border border-[var(--border)] p-3">
+                  <p className="text-[11px] uppercase tracking-wide text-[var(--text-muted)]">Generated</p>
+                  <p className="text-xs text-[var(--text-muted)] mt-2">
+                    {capabilityRegistry ? new Date(capabilityRegistry.generatedAt).toLocaleString() : "—"}
+                  </p>
+                </div>
+              </aside>
+            </div>
+          ) : (
+            <div className="rounded-lg border border-dashed border-[var(--border)] p-6 text-sm text-[var(--text-muted)]">
+              No capability data available yet.
+            </div>
+          )}
+        </div>
+      </section>
+
+      <section className={cardClassName()}>
+        <div className="px-4 py-3 border-b border-[var(--border)] flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+          <div>
+            <h3 className="text-sm font-medium text-[var(--text-muted)]">Runtime Adapters</h3>
+            <p className="text-xs text-[var(--text-muted)] mt-1">
+              Max-owned runtime bridge over external skills and MCP servers, aligned to the selected capability family and ready for policy-aware agent sessions.
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            {capabilityAdapters && (
+              <span className="text-xs text-[var(--text-muted)]">
+                {capabilityAdapters.totals.adapters} adapters · {capabilityAdapters.totals.classified} classified · {capabilityAdapters.totals.unclassified} unclassified
+              </span>
+            )}
+            <button
+              onClick={() => void loadCapabilityAdapters()}
+              className={buttonClassName()}
+              disabled={loadingCapabilityAdapters}
+            >
+              {loadingCapabilityAdapters ? "Refreshing..." : "Refresh"}
+            </button>
+          </div>
+        </div>
+
+        <div className="p-4 md:p-6 space-y-4">
+          {capabilityAdaptersError && (
+            <div className="rounded-lg bg-[rgba(239,68,68,0.15)] border border-[var(--danger)] p-3 text-sm text-[var(--danger)]">
+              {capabilityAdaptersError}
+            </div>
+          )}
+
+          {loadingCapabilityAdapters && !capabilityAdapters ? (
+            <div className="rounded-lg border border-dashed border-[var(--border)] p-6 text-sm text-[var(--text-muted)]">
+              Loading capability adapters…
+            </div>
+          ) : (
+            <div className="space-y-4">
+              <div className="rounded-xl border border-[var(--border)] bg-[var(--bg)] p-4">
+                <h4 className="text-lg font-semibold">
+                  {selectedCapabilityGroup?.label ?? formatCapabilityFamilyLabel(selectedCapabilityFamily)} adapters
+                </h4>
+                <p className="text-sm text-[var(--text-muted)] mt-1">
+                  These adapters are the runtime-facing bridge Max uses to turn external skill and MCP configuration into policy-aware session inputs.
+                </p>
+              </div>
+
+              {selectedCapabilityAdapters.length > 0 ? (
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+                  {selectedCapabilityAdapters.map((adapter) => (
+                    <div
+                      key={adapter.id}
+                      className="rounded-xl border border-[var(--border)] bg-[var(--bg)] p-4 space-y-3"
+                    >
+                      <div className="flex items-start justify-between gap-3">
+                        <div>
+                          <h5 className="text-sm font-semibold text-[var(--text)]">{adapter.name}</h5>
+                          <p className="text-xs text-[var(--text-muted)] mt-1">{adapter.description}</p>
+                        </div>
+                        <CapabilitySourceBadge source={adapter.sourceType} />
+                      </div>
+
+                      <div className="flex flex-wrap gap-2 text-[11px] text-[var(--text-muted)]">
+                        <span className="inline-flex items-center rounded-full border border-[var(--border)] px-2 py-0.5">
+                          Family: {formatCapabilityFamilyLabel(adapter.family)}
+                        </span>
+                        <span className="inline-flex items-center rounded-full border border-[var(--border)] px-2 py-0.5">
+                          Source: {adapter.sourceName}
+                        </span>
+                      </div>
+
+                      <div>
+                        <p className="text-[11px] uppercase tracking-wide text-[var(--text-muted)]">Runtime target</p>
+                        <code className="mt-1.5 block rounded-lg bg-[var(--bg-card)] px-3 py-2 text-[11px] text-[var(--accent)] break-all">
+                          {adapter.runtimeTarget}
+                        </code>
+                      </div>
+
+                      <div className="space-y-2">
+                        <div>
+                          <p className="text-[11px] uppercase tracking-wide text-[var(--text-muted)]">Tools</p>
+                          <div className="flex flex-wrap gap-1.5 mt-1.5">
+                            {adapter.tools.length > 0 ? adapter.tools.map((tool) => (
+                              <code
+                                key={`${adapter.id}-${tool}`}
+                                className="px-1.5 py-0.5 rounded bg-[var(--bg-card)] text-[var(--accent)] text-[11px]"
+                              >
+                                {tool}
+                              </code>
+                            )) : (
+                              <span className="text-xs text-[var(--text-muted)]">No direct tool list exposed by this adapter.</span>
+                            )}
+                          </div>
+                        </div>
+
+                        <div>
+                          <p className="text-[11px] uppercase tracking-wide text-[var(--text-muted)]">Surfaces</p>
+                          <div className="flex flex-wrap gap-1.5 mt-1.5">
+                            {adapter.surfaces.map((surface) => (
+                              <code
+                                key={`${adapter.id}-${surface}`}
+                                className="px-1.5 py-0.5 rounded bg-[var(--bg-card)] text-[var(--text-muted)] text-[11px]"
+                              >
+                                {surface}
+                              </code>
+                            ))}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="rounded-lg border border-dashed border-[var(--border)] p-6 text-sm text-[var(--text-muted)]">
+                  No runtime adapters are currently classified into this family.
+                </div>
+              )}
+
+              {unclassifiedCapabilityAdapters.length > 0 && (
+                <div className="rounded-xl border border-[var(--border)] bg-[var(--bg)] p-4 space-y-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <h4 className="text-sm font-semibold">Unclassified external adapters</h4>
+                      <p className="text-xs text-[var(--text-muted)] mt-1">
+                        These providers are visible to Max but still need family mapping before tighter policy profiles can govern them safely.
+                      </p>
+                    </div>
+                    <span className="inline-flex items-center rounded-full border border-[var(--border)] px-2 py-0.5 text-[11px] font-medium text-[var(--text-muted)]">
+                      {unclassifiedCapabilityAdapters.length}
+                    </span>
+                  </div>
+
+                  <div className="flex flex-wrap gap-2">
+                    {unclassifiedCapabilityAdapters.map((adapter) => (
+                      <span
+                        key={adapter.id}
+                        className="inline-flex items-center rounded-full border border-[var(--border)] px-2 py-1 text-[11px] text-[var(--text-muted)]"
+                      >
+                        {adapter.name} · {formatCapabilitySourceLabel(adapter.sourceType)}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </section>
 
       <section className={cardClassName()}>
         <div className="px-4 py-3 border-b border-[var(--border)] flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
@@ -923,6 +1409,24 @@ export default function SettingsPage() {
                 </div>
               ) : null}
 
+              {!isCreateMcpMode && selectedMcpEntry ? (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  <div className="rounded-lg border border-[var(--border)] bg-[var(--bg)] px-3 py-2 text-xs text-[var(--text-muted)]">
+                    <p>Tool source: <span className="text-[var(--text)]">{selectedMcpEntry.config.toolsSource ?? "configured"}</span></p>
+                    <p className="mt-1">Discovered at: <span className="text-[var(--text)]">{formatTimestamp(selectedMcpEntry.config.discoveredAt)}</span></p>
+                  </div>
+                  <div className="rounded-lg border border-[var(--border)] bg-[var(--bg)] px-3 py-2 text-xs text-[var(--text-muted)]">
+                    <p>Tool prefix: <span className="text-[var(--text)]">{selectedMcpEntry.config.toolPrefix ?? "—"}</span></p>
+                    <p className="mt-1">Eager discovery: <span className="text-[var(--text)]">{selectedMcpEntry.config.eagerDiscovery ? "enabled" : "disabled"}</span></p>
+                  </div>
+                  {selectedMcpEntry.config.discoveryError ? (
+                    <div className="md:col-span-2 rounded-lg border border-[rgba(239,68,68,0.35)] bg-[rgba(239,68,68,0.1)] px-3 py-2 text-xs text-[var(--danger)]">
+                      Last discovery error: {selectedMcpEntry.config.discoveryError}
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
+
               <div className="grid grid-cols-1 gap-4">
                 <Field label="Server Name" helper={isCreateMcpMode ? "Registry key stored under mcpServers" : "Stable key"}>
                   <input
@@ -958,6 +1462,16 @@ export default function SettingsPage() {
                         ? "Create MCP Server"
                         : "Save MCP Changes"}
                 </button>
+
+                {!isCreateMcpMode && selectedMcpEntry ? (
+                  <button
+                    onClick={() => void handleDiscoverMcpServer()}
+                    disabled={mcpSubmitting !== null}
+                    className={buttonClassName()}
+                  >
+                    {mcpSubmitting === "discover" ? "Discovering…" : "Discover Tools Now"}
+                  </button>
+                ) : null}
 
                 {!isCreateMcpMode && selectedMcpEntry ? (
                   <button

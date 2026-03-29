@@ -1,16 +1,64 @@
-import express from "express";
+import express, { Express } from "express";
 import type { Request, Response, NextFunction } from "express";
 import { readFileSync, writeFileSync, existsSync } from "fs";
 import { randomBytes } from "crypto";
 import { join } from "path";
 import { sendToOrchestrator, getWorkers, cancelCurrentMessage, getLastRouteResult } from "../copilot/orchestrator.js";
+import { getClient } from "../copilot/client.js";
 import { sendPhoto } from "../telegram/bot.js";
 import { config, persistModel } from "../config.js";
 import { getRouterConfig, updateRouterConfig } from "../copilot/router.js";
 import { listAvailableModels } from "../copilot/models.js";
-import { searchMemories } from "../store/db.js";
+import {
+  addAgentMemory,
+  addSessionMemory,
+  CHANNEL_ACCOUNT_TYPES,
+  createChannel,
+  createChannelAccount,
+  deleteChannel,
+  deleteChannelAccount,
+  getChannel,
+  getChannelAccount,
+  isChannelAccountType,
+  listChannelAccounts,
+  listChannelInbox,
+  listChannels,
+  removeAgentMemory,
+  removeSessionMemory,
+  searchAgentMemories,
+  searchMemories,
+  searchSessionMemories,
+  type MemoryCategory,
+  updateChannel,
+  updateChannelAccount,
+} from "../store/db.js";
+import {
+  CAPABILITY_FAMILIES,
+  buildCapabilityRegistry,
+  filterCapabilityRegistry,
+  isCapabilityFamily,
+  type CapabilityFamily,
+} from "../copilot/capability-registry.js";
+import {
+  buildCapabilityAdapterRegistry,
+  filterCapabilityAdapterRegistry,
+} from "../copilot/capability-adapters.js";
 import { createMcpServer, readMcpConfig, removeMcpServer, updateMcpServer } from "../copilot/mcp-config.js";
+import { discoverMcpServerTools, prepareMcpServerConfigForPersistence } from "../copilot/mcp-discovery.js";
 import { createSkill, listSkills, readSkill, removeSkill, updateSkill } from "../copilot/skills.js";
+import {
+  attachManagedSession,
+  detachManagedSession,
+  discoverMachineSessions,
+  findMachineSessionById,
+  findManagedMachineWorker,
+  getManagedSessionChatState,
+  listManagedMachineWorkers,
+  routeManagedSessions,
+  sendManagedSessionChatMessage,
+  updateManagedSessionMetadata,
+  type WorkerInfo,
+} from "../copilot/worker-sessions.js";
 import {
   createAgent,
   deleteAgent,
@@ -20,6 +68,7 @@ import {
   createProject,
   createSchedule,
   createTask,
+  getAgent,
   getControlPlaneOverview,
   listAgents,
   listHeartbeats,
@@ -38,6 +87,62 @@ import { restartDaemon } from "../daemon.js";
 import { API_TOKEN_PATH, MAX_HOME, ensureMaxHome } from "../paths.js";
 import { getHarnessStatus, readProgress, readFeatureList } from "../copilot/harness.js";
 
+function parseCapabilityFamilyList(value: unknown, fieldName: string): CapabilityFamily[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) {
+    throw new Error(`'${fieldName}' must be an array of capability family ids`);
+  }
+
+  const invalid = value.filter((entry) => typeof entry !== "string" || !isCapabilityFamily(entry));
+  if (invalid.length > 0) {
+    throw new Error(
+      `Invalid capability family in '${fieldName}'. Allowed values: ${CAPABILITY_FAMILIES.join(", ")}`
+    );
+  }
+
+  return value;
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseNullableObject(value: unknown, fieldName: string): Record<string, unknown> | null | undefined {
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  if (!isPlainObject(value)) {
+    throw new Error(`'${fieldName}' must be an object or null`);
+  }
+  return value;
+}
+
+function parsePositiveInteger(value: string | string[], fieldName: string): number {
+  if (Array.isArray(value)) {
+    throw new Error(`'${fieldName}' must be a positive integer`);
+  }
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(`'${fieldName}' must be a positive integer`);
+  }
+  return parsed;
+}
+
+function parseOptionalPositiveInteger(value: unknown, fieldName: string): number | undefined {
+  if (value === undefined || value === null || value === "") {
+    return undefined;
+  }
+  if (typeof value === "number") {
+    if (!Number.isInteger(value) || value <= 0) {
+      throw new Error(`'${fieldName}' must be a positive integer`);
+    }
+    return value;
+  }
+  if (typeof value !== "string") {
+    throw new Error(`'${fieldName}' must be a positive integer`);
+  }
+  return parsePositiveInteger(value, fieldName);
+}
+
 // Ensure token file exists (generate on first run)
 let apiToken: string | null = null;
 try {
@@ -53,7 +158,7 @@ try {
   process.exit(1);
 }
 
-export const app = express();
+export const app: Express = express();
 app.use(express.json());
 
 // CORS for dashboard dev server
@@ -129,6 +234,30 @@ function getMcpServerNameParam(req: Request): string {
   return getRouteParam(req, "name");
 }
 
+function getControlAgentIdFromWorkerName(name: string): number | null {
+  const match = /^control-agent-(\d+)$/.exec(name);
+  if (!match) return null;
+  return Number.parseInt(match[1], 10);
+}
+
+function serializeWorker(worker: WorkerInfo) {
+  return {
+    name: worker.name,
+    workingDir: worker.workingDir,
+    status: worker.status,
+    lastOutput: worker.lastOutput?.slice(0, 500),
+    isHarnessWorker: worker.isHarnessWorker,
+    controlAgentId: getControlAgentIdFromWorkerName(worker.name),
+    originChannel: worker.originChannel ?? null,
+    sessionSource: worker.sessionSource ?? null,
+    copilotSessionId: worker.copilotSessionId ?? null,
+    workspaceLabel: worker.workspaceLabel ?? null,
+    activationMode: worker.activationMode ?? "manual",
+    routingHint: worker.routingHint ?? null,
+    queueHint: worker.queueHint ?? null,
+  };
+}
+
 // Health check
 app.get("/status", (_req: Request, res: Response) => {
   const workers = Array.from(getWorkers().values());
@@ -137,12 +266,7 @@ app.get("/status", (_req: Request, res: Response) => {
   }
   res.json({
     status: "ok",
-    workers: workers.map((w) => ({
-      name: w.name,
-      workingDir: w.workingDir,
-      status: w.status,
-      isHarnessWorker: w.isHarnessWorker,
-    })),
+    workers: workers.map(serializeWorker),
   });
 });
 
@@ -150,15 +274,278 @@ app.get("/status", (_req: Request, res: Response) => {
 app.get("/sessions", (_req: Request, res: Response) => {
   const workers = Array.from(getWorkers().values()).map((w) => {
     if (w.isHarnessWorker) rememberHarnessDir(w.workingDir);
-    return {
-      name: w.name,
-      workingDir: w.workingDir,
-      status: w.status,
-      lastOutput: w.lastOutput?.slice(0, 500),
-      isHarnessWorker: w.isHarnessWorker,
-    };
+    return serializeWorker(w);
   });
   res.json(workers);
+});
+
+app.get("/native-sessions", (_req: Request, res: Response) => {
+  const sessions = listManagedMachineWorkers(getWorkers()).map(serializeWorker);
+  res.json({ sessions });
+});
+
+app.get("/native-sessions/route", (req: Request, res: Response) => {
+  const workspaceLabel = typeof req.query.workspaceLabel === "string" ? req.query.workspaceLabel : undefined;
+  const routingHint = typeof req.query.routingHint === "string" ? req.query.routingHint : undefined;
+  const queueHint = typeof req.query.queueHint === "string" ? req.query.queueHint : undefined;
+  const sessions = routeManagedSessions(getWorkers(), {
+    workspaceLabel,
+    routingHint,
+    queueHint,
+  }).map(serializeWorker);
+  res.json({ sessions });
+});
+
+app.get("/native-sessions/discover", (req: Request, res: Response) => {
+  const cwdFilter = typeof req.query.cwdFilter === "string" ? req.query.cwdFilter : undefined;
+  const limit = toOptionalInt(req.query.limit);
+  const result = discoverMachineSessions({ cwdFilter, limit });
+  if (!result.ok) {
+    res.status(500).json({ error: result.message });
+    return;
+  }
+  res.json({
+    message: result.message,
+    sessions: result.sessions,
+  });
+});
+
+app.post("/native-sessions/attach", async (req: Request, res: Response) => {
+  const { sessionId, name } = req.body as {
+    sessionId?: string;
+    name?: string;
+  };
+
+  if (!sessionId || typeof sessionId !== "string") {
+    res.status(400).json({ error: "Missing 'sessionId' in request body" });
+    return;
+  }
+  if (!name || typeof name !== "string") {
+    res.status(400).json({ error: "Missing 'name' in request body" });
+    return;
+  }
+
+  try {
+    const worker = await attachManagedSession({
+      client: await getClient(),
+      workers: getWorkers(),
+      sessionId,
+      name,
+      workingDir: findMachineSessionById(sessionId)?.workingDir ?? "(attached)",
+      sessionSource: "machine",
+    });
+    res.status(201).json({
+      ok: true,
+      message: `Attached native Copilot session '${sessionId}' as '${name}'.`,
+      worker: serializeWorker(worker),
+    });
+  } catch (err) {
+    res.status(400).json({
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+});
+
+app.delete("/native-sessions/:name", (req: Request, res: Response) => {
+  const name = getMcpServerNameParam(req);
+  const detached = detachManagedSession(name, getWorkers());
+  if (!detached) {
+    res.status(404).json({ error: `No attached native session named '${name}'.` });
+    return;
+  }
+
+  res.json({
+    ok: true,
+    message: `Detached native session '${name}' from Max management.`,
+    workerName: name,
+  });
+});
+
+app.patch("/native-sessions/:name/metadata", (req: Request, res: Response) => {
+  const name = getMcpServerNameParam(req);
+  const body = req.body as {
+    workspaceLabel?: string | null;
+    activationMode?: string;
+    routingHint?: string | null;
+    queueHint?: string | null;
+  };
+
+  const metadata: {
+    workspaceLabel?: string | null;
+    activationMode?: "manual" | "suggested" | "pinned";
+    routingHint?: string | null;
+    queueHint?: string | null;
+  } = {};
+
+  if (body.workspaceLabel !== undefined) {
+    if (body.workspaceLabel !== null && typeof body.workspaceLabel !== "string") {
+      res.status(400).json({ error: "'workspaceLabel' must be a string or null when provided" });
+      return;
+    }
+    metadata.workspaceLabel = typeof body.workspaceLabel === "string" && body.workspaceLabel.trim().length > 0
+      ? body.workspaceLabel.trim()
+      : null;
+  }
+
+  if (body.activationMode !== undefined) {
+    if (body.activationMode !== "manual" && body.activationMode !== "suggested" && body.activationMode !== "pinned") {
+      res.status(400).json({ error: "'activationMode' must be one of: manual, suggested, pinned" });
+      return;
+    }
+    metadata.activationMode = body.activationMode;
+  }
+
+  if (body.routingHint !== undefined) {
+    if (body.routingHint !== null && typeof body.routingHint !== "string") {
+      res.status(400).json({ error: "'routingHint' must be a string or null when provided" });
+      return;
+    }
+    metadata.routingHint = typeof body.routingHint === "string" && body.routingHint.trim().length > 0
+      ? body.routingHint.trim()
+      : null;
+  }
+
+  if (body.queueHint !== undefined) {
+    if (body.queueHint !== null && typeof body.queueHint !== "string") {
+      res.status(400).json({ error: "'queueHint' must be a string or null when provided" });
+      return;
+    }
+    metadata.queueHint = typeof body.queueHint === "string" && body.queueHint.trim().length > 0
+      ? body.queueHint.trim()
+      : null;
+  }
+
+  if (Object.keys(metadata).length === 0) {
+    res.status(400).json({ error: "Provide at least one metadata field to update" });
+    return;
+  }
+
+  const worker = updateManagedSessionMetadata(name, getWorkers(), metadata);
+  if (!worker) {
+    res.status(404).json({ error: `No attached native session named '${name}'.` });
+    return;
+  }
+
+  res.json({
+    ok: true,
+    message: `Updated native session metadata for '${name}'.`,
+    worker: serializeWorker(worker),
+  });
+});
+
+app.get("/native-sessions/:name/memory", (req: Request, res: Response) => {
+  try {
+    const name = getMcpServerNameParam(req);
+    if (!findManagedMachineWorker(name, getWorkers())) {
+      res.status(404).json({ error: `No attached native session named '${name}'.` });
+      return;
+    }
+    const category = typeof req.query.category === "string" ? req.query.category : undefined;
+    const keyword = typeof req.query.keyword === "string" ? req.query.keyword : undefined;
+    const limit = toOptionalInt(req.query.limit) ?? 100;
+    res.json(searchSessionMemories(name, keyword, category, limit));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(400).json({ error: msg });
+  }
+});
+
+app.post("/native-sessions/:name/memory", (req: Request, res: Response) => {
+  try {
+    const name = getMcpServerNameParam(req);
+    if (!findManagedMachineWorker(name, getWorkers())) {
+      res.status(404).json({ error: `No attached native session named '${name}'.` });
+      return;
+    }
+    const { category: rawCategory, content, source } = req.body as {
+      category?: unknown;
+      content?: unknown;
+      source?: unknown;
+    };
+    const category = parseMemoryCategory(rawCategory);
+    if (!category) {
+      res.status(400).json({ error: "Missing or invalid 'category' in request body" });
+      return;
+    }
+    if (!content || typeof content !== "string") {
+      res.status(400).json({ error: "Missing 'content' in request body" });
+      return;
+    }
+    const memoryId = addSessionMemory(name, category, content, source === "auto" ? "auto" : "user");
+    res.status(201).json({
+      id: memoryId,
+      category,
+      content: content.trim(),
+      source: source === "auto" ? "auto" : "user",
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(400).json({ error: msg });
+  }
+});
+
+app.delete("/native-sessions/:name/memory/:memoryId", (req: Request, res: Response) => {
+  try {
+    const name = getMcpServerNameParam(req);
+    const memoryId = Number(req.params.memoryId);
+    if (!findManagedMachineWorker(name, getWorkers())) {
+      res.status(404).json({ error: `No attached native session named '${name}'.` });
+      return;
+    }
+    if (!Number.isInteger(memoryId) || memoryId <= 0) {
+      res.status(400).json({ error: "Invalid memory id" });
+      return;
+    }
+    res.json({
+      ok: true,
+      removed: removeSessionMemory(name, memoryId),
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(400).json({ error: msg });
+  }
+});
+
+app.get("/native-sessions/:name/chat", (req: Request, res: Response) => {
+  try {
+    const name = getMcpServerNameParam(req);
+    const limit = toOptionalInt(req.query.limit) ?? 100;
+    const state = getManagedSessionChatState(name, getWorkers(), limit);
+    res.json({
+      session: serializeWorker(state.session),
+      history: state.history,
+    });
+  } catch (err) {
+    const statusCode = typeof err === "object" && err !== null && "statusCode" in err && typeof (err as { statusCode?: unknown }).statusCode === "number"
+      ? (err as { statusCode: number }).statusCode
+      : 400;
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(statusCode).json({ error: msg });
+  }
+});
+
+app.post("/native-sessions/:name/chat", async (req: Request, res: Response) => {
+  try {
+    const name = getMcpServerNameParam(req);
+    const { message } = req.body as { message?: string };
+    if (!message || typeof message !== "string") {
+      res.status(400).json({ error: "Missing 'message' in request body" });
+      return;
+    }
+
+    const result = await sendManagedSessionChatMessage(name, message, getWorkers());
+    res.json({
+      session: serializeWorker(result.session),
+      reply: result.reply,
+      history: result.history,
+    });
+  } catch (err) {
+    const statusCode = typeof err === "object" && err !== null && "statusCode" in err && typeof (err as { statusCode?: unknown }).statusCode === "number"
+      ? (err as { statusCode: number }).statusCode
+      : 400;
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(statusCode).json({ error: msg });
+  }
 });
 
 // SSE stream for real-time responses
@@ -169,6 +556,7 @@ app.get("/stream", (req: Request, res: Response) => {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache",
     Connection: "keep-alive",
+    "X-Connection-Id": connectionId,
   });
   res.write(`data: ${JSON.stringify({ type: "connected", connectionId })}\n\n`);
 
@@ -187,7 +575,13 @@ app.get("/stream", (req: Request, res: Response) => {
 
 // Send a message to the orchestrator
 app.post("/message", (req: Request, res: Response) => {
-  const { prompt, connectionId } = req.body as { prompt?: string; connectionId?: string };
+  const { prompt, connectionId, channelId, routeHint, senderId } = req.body as {
+    prompt?: string;
+    connectionId?: string;
+    channelId?: number | string;
+    routeHint?: unknown;
+    senderId?: unknown;
+  };
 
   if (!prompt || typeof prompt !== "string") {
     res.status(400).json({ error: "Missing 'prompt' in request body" });
@@ -199,9 +593,32 @@ app.post("/message", (req: Request, res: Response) => {
     return;
   }
 
+  let resolvedChannelId: number | undefined;
+  try {
+    resolvedChannelId = parseOptionalPositiveInteger(channelId, "channelId");
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+    return;
+  }
+
+  if (routeHint !== undefined && typeof routeHint !== "string") {
+    res.status(400).json({ error: "'routeHint' must be a string" });
+    return;
+  }
+  if (senderId !== undefined && typeof senderId !== "string") {
+    res.status(400).json({ error: "'senderId' must be a string" });
+    return;
+  }
+
   sendToOrchestrator(
     prompt,
-    { type: "tui", connectionId },
+    {
+      type: "tui",
+      connectionId,
+      channelId: resolvedChannelId,
+      ...(routeHint ? { routeHint } : {}),
+      ...(senderId ? { senderId } : {}),
+    },
     (text: string, done: boolean) => {
       const sseRes = sseClients.get(connectionId);
       if (sseRes) {
@@ -226,6 +643,235 @@ app.post("/message", (req: Request, res: Response) => {
   );
 
   res.json({ status: "queued" });
+});
+
+app.get("/channels/accounts", (req: Request, res: Response) => {
+  try {
+    const typeParam = req.query.type;
+    if (typeParam !== undefined && !isChannelAccountType(typeParam)) {
+      res.status(400).json({
+        error: `Invalid channel account type. Allowed values: ${CHANNEL_ACCOUNT_TYPES.join(", ")}`,
+      });
+      return;
+    }
+
+    const typeFilter = typeof typeParam === "string" && isChannelAccountType(typeParam)
+      ? typeParam
+      : undefined;
+
+    res.json({
+      accounts: listChannelAccounts({
+        type: typeFilter,
+      }),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+app.post("/channels/accounts", (req: Request, res: Response) => {
+  try {
+    const { type, name, metadata } = req.body as {
+      type?: unknown;
+      name?: unknown;
+      metadata?: unknown;
+    };
+
+    if (!isChannelAccountType(type)) {
+      res.status(400).json({
+        error: `Invalid 'type'. Allowed values: ${CHANNEL_ACCOUNT_TYPES.join(", ")}`,
+      });
+      return;
+    }
+    if (typeof name !== "string" || !name.trim()) {
+      res.status(400).json({ error: "Missing 'name' in request body" });
+      return;
+    }
+
+    const created = createChannelAccount({
+      type,
+      name,
+      metadata: parseNullableObject(metadata, "metadata"),
+    });
+    res.status(201).json({ account: created });
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+app.patch("/channels/accounts/:accountId", (req: Request, res: Response) => {
+  try {
+    const accountId = parsePositiveInteger(req.params.accountId, "accountId");
+    if (!getChannelAccount(accountId)) {
+      res.status(404).json({ error: `Channel account '${accountId}' was not found` });
+      return;
+    }
+
+    const { name, metadata } = req.body as {
+      name?: unknown;
+      metadata?: unknown;
+    };
+
+    if (name !== undefined && (typeof name !== "string" || !name.trim())) {
+      res.status(400).json({ error: "'name' must be a non-empty string" });
+      return;
+    }
+    const parsedMetadata = parseNullableObject(metadata, "metadata");
+    const updated = updateChannelAccount(accountId, {
+      ...(name !== undefined ? { name } : {}),
+      ...(metadata !== undefined ? { metadata: parsedMetadata } : {}),
+    });
+    res.json({ account: updated });
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+app.delete("/channels/accounts/:accountId", (req: Request, res: Response) => {
+  try {
+    const accountId = parsePositiveInteger(req.params.accountId, "accountId");
+    const deleted = deleteChannelAccount(accountId);
+    if (!deleted) {
+      res.status(404).json({ error: `Channel account '${accountId}' was not found` });
+      return;
+    }
+
+    res.json({ deleted: true });
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+app.get("/channels/accounts/:accountId/channels", (req: Request, res: Response) => {
+  try {
+    const accountId = parsePositiveInteger(req.params.accountId, "accountId");
+    if (!getChannelAccount(accountId)) {
+      res.status(404).json({ error: `Channel account '${accountId}' was not found` });
+      return;
+    }
+
+    res.json({
+      channels: listChannels({ accountId }),
+    });
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+app.post("/channels/accounts/:accountId/channels", (req: Request, res: Response) => {
+  try {
+    const accountId = parsePositiveInteger(req.params.accountId, "accountId");
+    if (!getChannelAccount(accountId)) {
+      res.status(404).json({ error: `Channel account '${accountId}' was not found` });
+      return;
+    }
+
+    const { name, displayName, icon, settings } = req.body as {
+      name?: unknown;
+      displayName?: unknown;
+      icon?: unknown;
+      settings?: unknown;
+    };
+
+    if (typeof name !== "string" || !name.trim()) {
+      res.status(400).json({ error: "Missing 'name' in request body" });
+      return;
+    }
+    if (displayName !== undefined && displayName !== null && typeof displayName !== "string") {
+      res.status(400).json({ error: "'displayName' must be a string or null" });
+      return;
+    }
+    if (icon !== undefined && icon !== null && typeof icon !== "string") {
+      res.status(400).json({ error: "'icon' must be a string or null" });
+      return;
+    }
+
+    const created = createChannel({
+      accountId,
+      name,
+      ...(displayName !== undefined ? { displayName: displayName as string | null } : {}),
+      ...(icon !== undefined ? { icon: icon as string | null } : {}),
+      ...(settings !== undefined ? { settings: parseNullableObject(settings, "settings") } : {}),
+    });
+    res.status(201).json({ channel: created });
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+app.patch("/channels/:channelId", (req: Request, res: Response) => {
+  try {
+    const channelId = parsePositiveInteger(req.params.channelId, "channelId");
+    if (!getChannel(channelId)) {
+      res.status(404).json({ error: `Channel '${channelId}' was not found` });
+      return;
+    }
+
+    const { name, displayName, icon, settings } = req.body as {
+      name?: unknown;
+      displayName?: unknown;
+      icon?: unknown;
+      settings?: unknown;
+    };
+
+    if (name !== undefined && (typeof name !== "string" || !name.trim())) {
+      res.status(400).json({ error: "'name' must be a non-empty string" });
+      return;
+    }
+    if (displayName !== undefined && displayName !== null && typeof displayName !== "string") {
+      res.status(400).json({ error: "'displayName' must be a string or null" });
+      return;
+    }
+    if (icon !== undefined && icon !== null && typeof icon !== "string") {
+      res.status(400).json({ error: "'icon' must be a string or null" });
+      return;
+    }
+
+    const updated = updateChannel(channelId, {
+      ...(name !== undefined ? { name } : {}),
+      ...(displayName !== undefined ? { displayName: displayName as string | null } : {}),
+      ...(icon !== undefined ? { icon: icon as string | null } : {}),
+      ...(settings !== undefined ? { settings: parseNullableObject(settings, "settings") } : {}),
+    });
+    res.json({ channel: updated });
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+app.delete("/channels/:channelId", (req: Request, res: Response) => {
+  try {
+    const channelId = parsePositiveInteger(req.params.channelId, "channelId");
+    const deleted = deleteChannel(channelId);
+    if (!deleted) {
+      res.status(404).json({ error: `Channel '${channelId}' was not found` });
+      return;
+    }
+
+    res.json({ deleted: true });
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+app.get("/channels/:channelId/inbox", (req: Request, res: Response) => {
+  try {
+    const channelId = parsePositiveInteger(req.params.channelId, "channelId");
+    const channel = getChannel(channelId, { includeDeleted: true });
+    if (!channel) {
+      res.status(404).json({ error: `Channel '${channelId}' was not found` });
+      return;
+    }
+
+    const limit = parseOptionalPositiveInteger(req.query.limit, "limit");
+    const beforeId = parseOptionalPositiveInteger(req.query.beforeId, "beforeId");
+    res.json({
+      channel,
+      messages: listChannelInbox(channelId, { limit, beforeId }),
+    });
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+  }
 });
 
 // Cancel the current in-flight message
@@ -306,6 +952,86 @@ app.post("/auto", (req: Request, res: Response) => {
 app.get("/memory", (_req: Request, res: Response) => {
   const memories = searchMemories(undefined, undefined, 100);
   res.json(memories);
+});
+
+function parseMemoryCategory(input: unknown): MemoryCategory | null {
+  return input === "preference" || input === "fact" || input === "project" || input === "person" || input === "routine"
+    ? input
+    : null;
+}
+
+app.get("/control/agents/:id/memory", (req: Request, res: Response) => {
+  try {
+    const agentId = Number(req.params.id);
+    if (!Number.isInteger(agentId) || agentId <= 0) {
+      res.status(400).json({ error: "Invalid agent id" });
+      return;
+    }
+    getAgent(agentId);
+    const category = typeof req.query.category === "string" ? req.query.category : undefined;
+    const keyword = typeof req.query.keyword === "string" ? req.query.keyword : undefined;
+    const limit = toOptionalInt(req.query.limit) ?? 100;
+    res.json(searchAgentMemories(agentId, keyword, category, limit));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(400).json({ error: msg });
+  }
+});
+
+app.post("/control/agents/:id/memory", (req: Request, res: Response) => {
+  try {
+    const agentId = Number(req.params.id);
+    if (!Number.isInteger(agentId) || agentId <= 0) {
+      res.status(400).json({ error: "Invalid agent id" });
+      return;
+    }
+    getAgent(agentId);
+    const { category: rawCategory, content, source } = req.body as {
+      category?: unknown;
+      content?: unknown;
+      source?: unknown;
+    };
+    const category = parseMemoryCategory(rawCategory);
+    if (!category) {
+      res.status(400).json({ error: "Missing or invalid 'category' in request body" });
+      return;
+    }
+    if (!content || typeof content !== "string") {
+      res.status(400).json({ error: "Missing 'content' in request body" });
+      return;
+    }
+    const memoryId = addAgentMemory(agentId, category, content, source === "auto" ? "auto" : "user");
+    forgetAgentRuntime(agentId);
+    res.status(201).json({
+      id: memoryId,
+      category,
+      content: content.trim(),
+      source: source === "auto" ? "auto" : "user",
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(400).json({ error: msg });
+  }
+});
+
+app.delete("/control/agents/:id/memory/:memoryId", (req: Request, res: Response) => {
+  try {
+    const agentId = Number(req.params.id);
+    const memoryId = Number(req.params.memoryId);
+    if (!Number.isInteger(agentId) || agentId <= 0 || !Number.isInteger(memoryId) || memoryId <= 0) {
+      res.status(400).json({ error: "Invalid agent or memory id" });
+      return;
+    }
+    getAgent(agentId);
+    const removed = removeAgentMemory(agentId, memoryId);
+    if (removed) {
+      forgetAgentRuntime(agentId);
+    }
+    res.json({ ok: true, removed });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(400).json({ error: msg });
+  }
 });
 
 // List skills
@@ -443,7 +1169,7 @@ app.get("/mcp", (_req: Request, res: Response) => {
   });
 });
 
-app.post("/mcp", (req: Request, res: Response) => {
+app.post("/mcp", async (req: Request, res: Response) => {
   const { name, config: serverConfig } = req.body as {
     name?: string;
     config?: unknown;
@@ -458,7 +1184,13 @@ app.post("/mcp", (req: Request, res: Response) => {
     return;
   }
 
-  const result = createMcpServer(name, serverConfig);
+  const prepared = await prepareMcpServerConfigForPersistence(name, serverConfig);
+  if (!prepared.ok || !prepared.server) {
+    res.status(400).json({ error: prepared.message });
+    return;
+  }
+
+  const result = createMcpServer(name, prepared.server);
   if (!result.ok || !result.server) {
     res.status(400).json({
       error: result.message,
@@ -476,7 +1208,7 @@ app.post("/mcp", (req: Request, res: Response) => {
   });
 });
 
-app.put("/mcp/:name", (req: Request, res: Response) => {
+app.put("/mcp/:name", async (req: Request, res: Response) => {
   const serverName = getMcpServerNameParam(req);
   const { config: serverConfig } = req.body as {
     config?: unknown;
@@ -487,7 +1219,13 @@ app.put("/mcp/:name", (req: Request, res: Response) => {
     return;
   }
 
-  const result = updateMcpServer(serverName, serverConfig);
+  const prepared = await prepareMcpServerConfigForPersistence(serverName, serverConfig);
+  if (!prepared.ok || !prepared.server) {
+    res.status(400).json({ error: prepared.message });
+    return;
+  }
+
+  const result = updateMcpServer(serverName, prepared.server);
   if (!result.ok || !result.server) {
     res.status(400).json({
       error: result.message,
@@ -524,6 +1262,45 @@ app.delete("/mcp/:name", (req: Request, res: Response) => {
   });
 });
 
+app.post("/mcp/:name/discover", async (req: Request, res: Response) => {
+  const serverName = getMcpServerNameParam(req);
+  const current = readMcpConfig();
+  if (!current.ok || !current.document) {
+    res.status(400).json({ error: current.message });
+    return;
+  }
+
+  const serverConfig = current.document.mcpServers[serverName];
+  if (!serverConfig) {
+    res.status(404).json({ error: `MCP server '${serverName}' not found.` });
+    return;
+  }
+
+  const discovery = await discoverMcpServerTools(serverName, serverConfig);
+  if (!discovery.ok || !discovery.server) {
+    res.status(400).json({ error: discovery.message });
+    return;
+  }
+
+  const result = updateMcpServer(serverName, discovery.server);
+  if (!result.ok || !result.server) {
+    res.status(400).json({
+      error: result.message,
+      ...(result.errors ? { errors: result.errors } : {}),
+    });
+    return;
+  }
+
+  res.json({
+    ok: true,
+    message: discovery.message,
+    configPath: result.configPath,
+    serverName,
+    server: result.server,
+    discoveredTools: discovery.tools,
+  });
+});
+
 // Remove a local skill
 app.delete("/skills/:slug", (req: Request, res: Response) => {
   const slug = getSlugParam(req);
@@ -533,6 +1310,46 @@ app.delete("/skills/:slug", (req: Request, res: Response) => {
   } else {
     res.json({ ok: true, message: result.message });
   }
+});
+
+app.get("/capabilities", (req: Request, res: Response) => {
+  const familyFilter = req.query.family;
+  const queryFilter = req.query.q;
+
+  if (typeof familyFilter === "string" && !isCapabilityFamily(familyFilter)) {
+    res.status(400).json({
+      error: `Invalid capability family '${familyFilter}'.`,
+      families: [...CAPABILITY_FAMILIES],
+    });
+    return;
+  }
+
+  const registry = buildCapabilityRegistry();
+  const filteredRegistry = filterCapabilityRegistry(registry, {
+    family: typeof familyFilter === "string" ? familyFilter : undefined,
+    query: typeof queryFilter === "string" ? queryFilter : undefined,
+  });
+  res.json(filteredRegistry);
+});
+
+app.get("/capability-adapters", (req: Request, res: Response) => {
+  const familyFilter = req.query.family;
+  const queryFilter = req.query.q;
+
+  if (typeof familyFilter === "string" && !isCapabilityFamily(familyFilter)) {
+    res.status(400).json({
+      error: `Invalid capability family '${familyFilter}'.`,
+      families: [...CAPABILITY_FAMILIES],
+    });
+    return;
+  }
+
+  const registry = buildCapabilityAdapterRegistry();
+  const filteredRegistry = filterCapabilityAdapterRegistry(registry, {
+    family: typeof familyFilter === "string" ? familyFilter : undefined,
+    query: typeof queryFilter === "string" ? queryFilter : undefined,
+  });
+  res.json(filteredRegistry);
 });
 
 // Restart daemon
@@ -743,6 +1560,9 @@ app.post("/control/agents", (req: Request, res: Response) => {
       defaultPrompt,
       heartbeatPrompt,
       heartbeatIntervalSeconds,
+      toolProfile,
+      allowedCapabilityFamilies,
+      blockedCapabilityFamilies,
       automationEnabled,
       status,
     } = req.body as {
@@ -755,6 +1575,9 @@ app.post("/control/agents", (req: Request, res: Response) => {
       defaultPrompt?: string;
       heartbeatPrompt?: string;
       heartbeatIntervalSeconds?: number | null;
+      toolProfile?: string;
+      allowedCapabilityFamilies?: string[];
+      blockedCapabilityFamilies?: string[];
       automationEnabled?: boolean;
       status?: string;
     };
@@ -766,6 +1589,14 @@ app.post("/control/agents", (req: Request, res: Response) => {
       res.status(400).json({ error: "Missing 'name' in request body" });
       return;
     }
+    const parsedAllowedCapabilityFamilies = parseCapabilityFamilyList(
+      allowedCapabilityFamilies,
+      "allowedCapabilityFamilies"
+    );
+    const parsedBlockedCapabilityFamilies = parseCapabilityFamilyList(
+      blockedCapabilityFamilies,
+      "blockedCapabilityFamilies"
+    );
     res.status(201).json(createAgent({
       projectId,
       name,
@@ -776,6 +1607,9 @@ app.post("/control/agents", (req: Request, res: Response) => {
       defaultPrompt,
       heartbeatPrompt,
       heartbeatIntervalSeconds: typeof heartbeatIntervalSeconds === "number" ? heartbeatIntervalSeconds : null,
+      toolProfile,
+      allowedCapabilityFamilies: parsedAllowedCapabilityFamilies,
+      blockedCapabilityFamilies: parsedBlockedCapabilityFamilies,
       automationEnabled,
       status,
     }));
@@ -801,6 +1635,9 @@ app.patch("/control/agents/:id", (req: Request, res: Response) => {
       defaultPrompt,
       heartbeatPrompt,
       heartbeatIntervalSeconds,
+      toolProfile,
+      allowedCapabilityFamilies,
+      blockedCapabilityFamilies,
       automationEnabled,
       status,
     } = req.body as {
@@ -812,9 +1649,20 @@ app.patch("/control/agents/:id", (req: Request, res: Response) => {
       defaultPrompt?: string;
       heartbeatPrompt?: string;
       heartbeatIntervalSeconds?: number | null;
+      toolProfile?: string;
+      allowedCapabilityFamilies?: string[];
+      blockedCapabilityFamilies?: string[];
       automationEnabled?: boolean;
       status?: string;
     };
+    const parsedAllowedCapabilityFamilies = parseCapabilityFamilyList(
+      allowedCapabilityFamilies,
+      "allowedCapabilityFamilies"
+    );
+    const parsedBlockedCapabilityFamilies = parseCapabilityFamilyList(
+      blockedCapabilityFamilies,
+      "blockedCapabilityFamilies"
+    );
     res.json(updateAgent({
       id: agentId,
       projectId: typeof projectId === "number" ? projectId : undefined,
@@ -827,6 +1675,9 @@ app.patch("/control/agents/:id", (req: Request, res: Response) => {
       heartbeatIntervalSeconds: heartbeatIntervalSeconds === null || typeof heartbeatIntervalSeconds === "number"
         ? heartbeatIntervalSeconds
         : undefined,
+      toolProfile,
+      allowedCapabilityFamilies: parsedAllowedCapabilityFamilies,
+      blockedCapabilityFamilies: parsedBlockedCapabilityFamilies,
       automationEnabled,
       status,
     }));

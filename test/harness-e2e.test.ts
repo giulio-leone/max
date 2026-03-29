@@ -24,6 +24,11 @@ vi.mock("../src/store/db.js", () => {
     addMemory: vi.fn(),
     searchMemories: vi.fn(() => []),
     removeMemory: vi.fn(),
+    listPersistedWorkerSessions: vi.fn(() => []),
+    upsertWorkerSession: vi.fn(),
+    updateWorkerSessionStatus: vi.fn(),
+    updateWorkerSessionMetadata: vi.fn(),
+    deleteWorkerSession: vi.fn(),
   };
 });
 

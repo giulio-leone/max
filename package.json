@@ -43,19 +43,20 @@
   },
   "type": "module",
   "dependencies": {
-    "@github/copilot-sdk": "0.1.30",
-    "better-sqlite3": "^12.6.2",
+    "@github/copilot-sdk": "0.2.0",
+    "@modelcontextprotocol/sdk": "^1.28.0",
+    "better-sqlite3": "^12.8.0",
     "dotenv": "^17.3.1",
     "express": "^5.2.1",
-    "grammy": "^1.40.0",
+    "grammy": "^1.41.1",
     "zod": "^4.3.6"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
     "@types/express": "^5.0.6",
-    "@types/node": "^25.3.0",
+    "@types/node": "^25.5.0",
     "tsx": "^4.21.0",
-    "typescript": "^5.9.3",
-    "vitest": "^4.1.0"
+    "typescript": "^6.0.2",
+    "vitest": "^4.1.2"
   }
 }

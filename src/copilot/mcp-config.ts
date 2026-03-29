@@ -8,10 +8,25 @@ import {
 } from "fs";
 import { join } from "path";
 import { homedir } from "os";
-import type { MCPServerConfig } from "@github/copilot-sdk";
+import type { MCPLocalServerConfig, MCPRemoteServerConfig, MCPServerConfig } from "@github/copilot-sdk";
+
+export type McpToolSource = "configured" | "discovered";
+
+export interface MaxMcpServerConfigExtras {
+  toolPrefix?: string;
+  eagerDiscovery?: boolean;
+  discoveryTimeoutMs?: number;
+  toolsSource?: McpToolSource;
+  discoveredAt?: string;
+  discoveryError?: string;
+}
+
+export type MaxMcpServerConfig =
+  | (MCPLocalServerConfig & MaxMcpServerConfigExtras)
+  | (MCPRemoteServerConfig & MaxMcpServerConfigExtras);
 
 export interface McpConfigDocument {
-  mcpServers: Record<string, MCPServerConfig>;
+  mcpServers: Record<string, MaxMcpServerConfig>;
   [key: string]: unknown;
 }
 
@@ -32,7 +47,7 @@ export interface McpConfigMutationResult {
   message: string;
   configPath: string;
   document?: McpConfigDocument;
-  server?: MCPServerConfig;
+  server?: MaxMcpServerConfig;
   errors?: string[];
 }
 
@@ -56,6 +71,10 @@ function isStringRecord(value: unknown): value is Record<string, string> {
   return isPlainObject(value) && Object.values(value).every((item) => typeof item === "string");
 }
 
+function isMcpToolSource(value: unknown): value is McpToolSource {
+  return value === "configured" || value === "discovered";
+}
+
 function isSafeServerName(name: string): boolean {
   return name.trim().length > 0
     && name.trim() === name
@@ -69,6 +88,52 @@ function cloneDocument(document: McpConfigDocument): McpConfigDocument {
     ...document,
     mcpServers: { ...document.mcpServers },
   };
+}
+
+function normalizeMcpServerConfig(serverConfig: MaxMcpServerConfig): MaxMcpServerConfig {
+  const normalized: Record<string, unknown> = { ...serverConfig };
+
+  normalized.tools = Array.isArray(serverConfig.tools)
+    ? serverConfig.tools.filter((tool): tool is string => typeof tool === "string")
+    : [];
+
+  if (typeof serverConfig.toolPrefix === "string" && serverConfig.toolPrefix.trim().length > 0) {
+    normalized.toolPrefix = serverConfig.toolPrefix.trim();
+  } else {
+    delete normalized.toolPrefix;
+  }
+
+  if (typeof serverConfig.eagerDiscovery === "boolean") {
+    normalized.eagerDiscovery = serverConfig.eagerDiscovery;
+  } else {
+    delete normalized.eagerDiscovery;
+  }
+
+  if (typeof serverConfig.discoveryTimeoutMs === "number" && Number.isFinite(serverConfig.discoveryTimeoutMs)) {
+    normalized.discoveryTimeoutMs = serverConfig.discoveryTimeoutMs;
+  } else {
+    delete normalized.discoveryTimeoutMs;
+  }
+
+  if (isMcpToolSource(serverConfig.toolsSource)) {
+    normalized.toolsSource = serverConfig.toolsSource;
+  } else {
+    normalized.toolsSource = "configured";
+  }
+
+  if (typeof serverConfig.discoveredAt === "string" && serverConfig.discoveredAt.trim().length > 0) {
+    normalized.discoveredAt = serverConfig.discoveredAt;
+  } else {
+    delete normalized.discoveredAt;
+  }
+
+  if (typeof serverConfig.discoveryError === "string" && serverConfig.discoveryError.trim().length > 0) {
+    normalized.discoveryError = serverConfig.discoveryError.trim();
+  } else {
+    delete normalized.discoveryError;
+  }
+
+  return normalized as unknown as MaxMcpServerConfig;
 }
 
 function parseMcpDocument(raw: string, configPath: string): McpConfigReadResult {
@@ -99,7 +164,7 @@ function parseMcpDocument(raw: string, configPath: string): McpConfigReadResult 
       configPath,
       document: {
         ...parsed,
-        mcpServers: (mcpServersRaw as Record<string, MCPServerConfig> | undefined) ?? {},
+        mcpServers: (mcpServersRaw as Record<string, MaxMcpServerConfig> | undefined) ?? {},
       },
     };
   } catch (err) {
@@ -172,6 +237,11 @@ export function loadMcpConfig(): Record<string, MCPServerConfig> {
   return result.ok && result.document ? result.document.mcpServers : {};
 }
 
+export function loadMaxMcpConfig(): Record<string, MaxMcpServerConfig> {
+  const result = readExistingDocument();
+  return result.ok && result.document ? result.document.mcpServers : {};
+}
+
 export function readMcpConfig(): McpConfigReadResult {
   return readExistingDocument();
 }
@@ -200,6 +270,30 @@ export function validateMcpServerConfig(serverName: string, serverConfig: unknow
   }
   if (serverConfig.timeout !== undefined && typeof serverConfig.timeout !== "number") {
     errors.push("'timeout' must be a number when provided.");
+  }
+  if (serverConfig.toolPrefix !== undefined && typeof serverConfig.toolPrefix !== "string") {
+    errors.push("'toolPrefix' must be a string when provided.");
+  }
+  if (typeof serverConfig.toolPrefix === "string" && serverConfig.toolPrefix.trim().length === 0) {
+    errors.push("'toolPrefix' cannot be empty when provided.");
+  }
+  if (serverConfig.eagerDiscovery !== undefined && typeof serverConfig.eagerDiscovery !== "boolean") {
+    errors.push("'eagerDiscovery' must be a boolean when provided.");
+  }
+  if (
+    serverConfig.discoveryTimeoutMs !== undefined
+    && (typeof serverConfig.discoveryTimeoutMs !== "number" || !Number.isFinite(serverConfig.discoveryTimeoutMs) || serverConfig.discoveryTimeoutMs <= 0)
+  ) {
+    errors.push("'discoveryTimeoutMs' must be a positive number when provided.");
+  }
+  if (serverConfig.toolsSource !== undefined && !isMcpToolSource(serverConfig.toolsSource)) {
+    errors.push("'toolsSource' must be either 'configured' or 'discovered' when provided.");
+  }
+  if (serverConfig.discoveredAt !== undefined && typeof serverConfig.discoveredAt !== "string") {
+    errors.push("'discoveredAt' must be a string when provided.");
+  }
+  if (serverConfig.discoveryError !== undefined && typeof serverConfig.discoveryError !== "string") {
+    errors.push("'discoveryError' must be a string when provided.");
   }
   if (serverConfig.source !== undefined && typeof serverConfig.source !== "string") {
     errors.push("'source' must be a string when provided.");
@@ -276,7 +370,7 @@ export function createMcpServer(
     };
   }
 
-  const nextServer = serverConfig as MCPServerConfig;
+  const nextServer = normalizeMcpServerConfig(serverConfig as MaxMcpServerConfig);
   const document = cloneDocument(existing.document);
   document.mcpServers[serverName] = nextServer;
   const written = writeDocument(document);
@@ -320,7 +414,7 @@ export function updateMcpServer(
     };
   }
 
-  const nextServer = serverConfig as MCPServerConfig;
+  const nextServer = normalizeMcpServerConfig(serverConfig as MaxMcpServerConfig);
   const document = cloneDocument(existing.document);
   document.mcpServers[serverName] = nextServer;
   const written = writeDocument(document);

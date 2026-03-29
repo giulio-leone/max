@@ -43,10 +43,16 @@ export default function RootLayout({
                 <span>🧭</span> Control Plane
               </a>
               <a
+                href="/channels"
+                className="flex items-center gap-2 px-3 py-2 rounded-lg text-sm text-[var(--text-muted)] hover:text-[var(--text)] hover:bg-[var(--bg-card-hover)] mt-1"
+              >
+                <span>📬</span> Channels
+              </a>
+              <a
                 href="/chat"
                 className="flex items-center gap-2 px-3 py-2 rounded-lg text-sm text-[var(--text-muted)] hover:text-[var(--text)] hover:bg-[var(--bg-card-hover)] mt-1"
               >
-                <span>💬</span> Agent Chat
+                <span>💬</span> Chat
               </a>
               <a
                 href="/settings"

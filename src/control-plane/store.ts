@@ -1,4 +1,10 @@
 import { getDb } from "../store/db.js";
+import {
+  normalizeCapabilityFamilies,
+  normalizeToolProfile,
+  type CapabilityFamily,
+  type ToolProfile,
+} from "../copilot/capability-registry.js";
 import { validateScheduleDefinition } from "./schedule-expression.js";
 
 export interface Project {
@@ -43,6 +49,9 @@ export interface AgentRecord {
   defaultPrompt: string | null;
   heartbeatPrompt: string | null;
   heartbeatIntervalSeconds: number | null;
+  toolProfile: ToolProfile;
+  allowedCapabilityFamilies: CapabilityFamily[];
+  blockedCapabilityFamilies: CapabilityFamily[];
   automationEnabled: boolean;
   status: string;
   lastHeartbeatAt: string | null;
@@ -161,6 +170,24 @@ function ensureSchema() {
     db.exec(`ALTER TABLE control_agents ADD COLUMN automation_enabled INTEGER NOT NULL DEFAULT 1`);
   }
 
+  try {
+    db.prepare(`SELECT tool_profile FROM control_agents LIMIT 1`).get();
+  } catch {
+    db.exec(`ALTER TABLE control_agents ADD COLUMN tool_profile TEXT NOT NULL DEFAULT 'all'`);
+  }
+
+  try {
+    db.prepare(`SELECT allowed_capability_families FROM control_agents LIMIT 1`).get();
+  } catch {
+    db.exec(`ALTER TABLE control_agents ADD COLUMN allowed_capability_families TEXT`);
+  }
+
+  try {
+    db.prepare(`SELECT blocked_capability_families FROM control_agents LIMIT 1`).get();
+  } catch {
+    db.exec(`ALTER TABLE control_agents ADD COLUMN blocked_capability_families TEXT`);
+  }
+
   db.exec(`
     CREATE TABLE IF NOT EXISTS control_tasks (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -229,6 +256,20 @@ function ensureSchema() {
 function normalizeText(value: string | undefined): string | null {
   const trimmed = value?.trim();
   return trimmed ? trimmed : null;
+}
+
+function serializeCapabilityFamilies(families: readonly CapabilityFamily[]): string | null {
+  return families.length > 0 ? JSON.stringify(families) : null;
+}
+
+function parseCapabilityFamilies(raw: string | null): CapabilityFamily[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return normalizeCapabilityFamilies(Array.isArray(parsed) ? parsed : []);
+  } catch {
+    return [];
+  }
 }
 
 export function validateHeartbeatPromptInput(prompt: string | null): void {
@@ -341,6 +382,9 @@ function asAgent(row: {
   default_prompt: string | null;
   heartbeat_prompt: string | null;
   heartbeat_interval_seconds: number | null;
+  tool_profile: string | null;
+  allowed_capability_families: string | null;
+  blocked_capability_families: string | null;
   automation_enabled: number;
   status: string;
   last_heartbeat_at: string | null;
@@ -359,6 +403,9 @@ function asAgent(row: {
     defaultPrompt: row.default_prompt,
     heartbeatPrompt: row.heartbeat_prompt,
     heartbeatIntervalSeconds: row.heartbeat_interval_seconds,
+    toolProfile: normalizeToolProfile(row.tool_profile),
+    allowedCapabilityFamilies: parseCapabilityFamilies(row.allowed_capability_families),
+    blockedCapabilityFamilies: parseCapabilityFamilies(row.blocked_capability_families),
     automationEnabled: row.automation_enabled === 1,
     status: row.status,
     lastHeartbeatAt: row.last_heartbeat_at,
@@ -379,6 +426,9 @@ function asAgentRuntime(row: {
   default_prompt: string | null;
   heartbeat_prompt: string | null;
   heartbeat_interval_seconds: number | null;
+  tool_profile: string | null;
+  allowed_capability_families: string | null;
+  blocked_capability_families: string | null;
   automation_enabled: number;
   status: string;
   last_heartbeat_at: string | null;
@@ -496,6 +546,9 @@ export function getAgent(agentId: number): AgentRecord {
       a.default_prompt,
       a.heartbeat_prompt,
       a.heartbeat_interval_seconds,
+      a.tool_profile,
+      a.allowed_capability_families,
+      a.blocked_capability_families,
       a.automation_enabled,
       a.status,
       a.last_heartbeat_at,
@@ -516,6 +569,9 @@ export function getAgent(agentId: number): AgentRecord {
       default_prompt: string | null;
       heartbeat_prompt: string | null;
       heartbeat_interval_seconds: number | null;
+      tool_profile: string | null;
+      allowed_capability_families: string | null;
+      blocked_capability_families: string | null;
       automation_enabled: number;
       status: string;
       last_heartbeat_at: string | null;
@@ -542,6 +598,9 @@ export function getAgentRuntime(agentId: number): AgentRuntimeRecord {
       a.default_prompt,
       a.heartbeat_prompt,
       a.heartbeat_interval_seconds,
+      a.tool_profile,
+      a.allowed_capability_families,
+      a.blocked_capability_families,
       a.automation_enabled,
       a.status,
       a.last_heartbeat_at,
@@ -563,6 +622,9 @@ export function getAgentRuntime(agentId: number): AgentRuntimeRecord {
       default_prompt: string | null;
       heartbeat_prompt: string | null;
       heartbeat_interval_seconds: number | null;
+      tool_profile: string | null;
+      allowed_capability_families: string | null;
+      blocked_capability_families: string | null;
       automation_enabled: number;
       status: string;
       last_heartbeat_at: string | null;
@@ -920,6 +982,9 @@ export function listAgents(projectId?: number): AgentRecord[] {
       a.default_prompt,
       a.heartbeat_prompt,
       a.heartbeat_interval_seconds,
+      a.tool_profile,
+      a.allowed_capability_families,
+      a.blocked_capability_families,
       a.automation_enabled,
       a.status,
       a.last_heartbeat_at,
@@ -939,16 +1004,19 @@ export function listAgents(projectId?: number): AgentRecord[] {
     slug: string;
     name: string;
     agent_type: string;
-      working_dir: string | null;
-      model: string | null;
-      default_prompt: string | null;
-      heartbeat_prompt: string | null;
-      heartbeat_interval_seconds: number | null;
-      automation_enabled: number;
-      status: string;
-      last_heartbeat_at: string | null;
-      created_at: string;
-      updated_at: string;
+    working_dir: string | null;
+    model: string | null;
+    default_prompt: string | null;
+    heartbeat_prompt: string | null;
+    heartbeat_interval_seconds: number | null;
+    tool_profile: string | null;
+    allowed_capability_families: string | null;
+    blocked_capability_families: string | null;
+    automation_enabled: number;
+    status: string;
+    last_heartbeat_at: string | null;
+    created_at: string;
+    updated_at: string;
   }[];
   return rows.map(asAgent);
 }
@@ -963,6 +1031,9 @@ export function createAgent(input: {
   defaultPrompt?: string;
   heartbeatPrompt?: string;
   heartbeatIntervalSeconds?: number | null;
+  toolProfile?: ToolProfile | string;
+  allowedCapabilityFamilies?: CapabilityFamily[];
+  blockedCapabilityFamilies?: CapabilityFamily[];
   automationEnabled?: boolean;
   status?: string;
 }): AgentRecord {
@@ -974,6 +1045,9 @@ export function createAgent(input: {
   const defaultPrompt = normalizeText(input.defaultPrompt);
   const heartbeatPrompt = normalizeText(input.heartbeatPrompt);
   validateHeartbeatPromptInput(heartbeatPrompt);
+  const toolProfile = normalizeToolProfile(input.toolProfile);
+  const allowedCapabilityFamilies = normalizeCapabilityFamilies(input.allowedCapabilityFamilies);
+  const blockedCapabilityFamilies = normalizeCapabilityFamilies(input.blockedCapabilityFamilies);
   const automationEnabled = resolveAutomationEnabled({
     automationEnabled: input.automationEnabled,
     fallback: true,
@@ -991,10 +1065,13 @@ export function createAgent(input: {
       default_prompt,
       heartbeat_prompt,
       heartbeat_interval_seconds,
+      tool_profile,
+      allowed_capability_families,
+      blocked_capability_families,
       automation_enabled,
       status
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     input.projectId,
     slugify(input.slug ?? input.name),
@@ -1005,6 +1082,9 @@ export function createAgent(input: {
     defaultPrompt,
     heartbeatPrompt,
     input.heartbeatIntervalSeconds ?? null,
+    toolProfile,
+    serializeCapabilityFamilies(allowedCapabilityFamilies),
+    serializeCapabilityFamilies(blockedCapabilityFamilies),
     automationEnabled ? 1 : 0,
     status
   );
@@ -1022,6 +1102,9 @@ export function updateAgent(input: {
   defaultPrompt?: string;
   heartbeatPrompt?: string;
   heartbeatIntervalSeconds?: number | null;
+  toolProfile?: ToolProfile | string;
+  allowedCapabilityFamilies?: CapabilityFamily[];
+  blockedCapabilityFamilies?: CapabilityFamily[];
   automationEnabled?: boolean;
   status?: string;
 }): AgentRecord {
@@ -1040,6 +1123,15 @@ export function updateAgent(input: {
   const nextHeartbeatInterval = input.heartbeatIntervalSeconds !== undefined
     ? input.heartbeatIntervalSeconds
     : existing.heartbeatIntervalSeconds;
+  const nextToolProfile = input.toolProfile !== undefined
+    ? normalizeToolProfile(input.toolProfile)
+    : existing.toolProfile;
+  const nextAllowedCapabilityFamilies = input.allowedCapabilityFamilies !== undefined
+    ? normalizeCapabilityFamilies(input.allowedCapabilityFamilies)
+    : existing.allowedCapabilityFamilies;
+  const nextBlockedCapabilityFamilies = input.blockedCapabilityFamilies !== undefined
+    ? normalizeCapabilityFamilies(input.blockedCapabilityFamilies)
+    : existing.blockedCapabilityFamilies;
   validateHeartbeatPromptInput(nextHeartbeatPrompt);
   const nextAutomationEnabled = resolveAutomationEnabled({
     automationEnabled: input.automationEnabled,
@@ -1051,7 +1143,10 @@ export function updateAgent(input: {
     || nextWorkingDir !== existing.workingDir
     || nextModel !== existing.model
     || nextDefaultPrompt !== existing.defaultPrompt
-    || nextHeartbeatPrompt !== existing.heartbeatPrompt;
+    || nextHeartbeatPrompt !== existing.heartbeatPrompt
+    || nextToolProfile !== existing.toolProfile
+    || JSON.stringify(nextAllowedCapabilityFamilies) !== JSON.stringify(existing.allowedCapabilityFamilies)
+    || JSON.stringify(nextBlockedCapabilityFamilies) !== JSON.stringify(existing.blockedCapabilityFamilies);
 
   const db = getDb();
   const result = db.prepare(`
@@ -1065,6 +1160,9 @@ export function updateAgent(input: {
       default_prompt = ?,
       heartbeat_prompt = ?,
       heartbeat_interval_seconds = ?,
+      tool_profile = ?,
+      allowed_capability_families = ?,
+      blocked_capability_families = ?,
       automation_enabled = ?,
       status = ?,
       copilot_session_id = ?,
@@ -1079,6 +1177,9 @@ export function updateAgent(input: {
     nextDefaultPrompt,
     nextHeartbeatPrompt,
     nextHeartbeatInterval ?? null,
+    nextToolProfile,
+    serializeCapabilityFamilies(nextAllowedCapabilityFamilies),
+    serializeCapabilityFamilies(nextBlockedCapabilityFamilies),
     nextAutomationEnabled ? 1 : 0,
     nextStatus,
     resetSession ? null : existing.copilotSessionId,
@@ -1107,6 +1208,7 @@ export function deleteAgent(agentId: number): void {
   }
 
   db.prepare(`DELETE FROM control_agent_messages WHERE agent_id = ?`).run(agentId);
+  db.prepare(`DELETE FROM scoped_memories WHERE scope_type = 'agent' AND scope_id = ?`).run(String(agentId));
   const result = db.prepare(`DELETE FROM control_agents WHERE id = ?`).run(agentId);
   if (result.changes === 0) throw new Error(`Agent ${agentId} not found`);
 }

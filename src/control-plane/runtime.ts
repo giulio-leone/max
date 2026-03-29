@@ -1,11 +1,17 @@
 import { approveAll, type CopilotSession } from "@github/copilot-sdk";
 import { config } from "../config.js";
+import { resolveRuntimeCapabilityAdapters } from "../copilot/capability-adapters.js";
+import {
+  describeAgentCapabilityPolicy,
+  filterBuiltinToolsByPolicy,
+  resolveAgentCapabilityPolicy,
+} from "../copilot/capability-registry.js";
 import { getClient } from "../copilot/client.js";
-import { loadMcpConfig } from "../copilot/mcp-config.js";
 import { getWorkers } from "../copilot/orchestrator.js";
-import { getSkillDirectories } from "../copilot/skills.js";
+import { listSkills } from "../copilot/skills.js";
 import { createTools, type WorkerInfo } from "../copilot/tools.js";
 import { SESSIONS_DIR } from "../paths.js";
+import { getAgentMemorySummary } from "../store/db.js";
 import {
   createAgentMessage,
   getAgent,
@@ -40,6 +46,12 @@ function trimForRecovery(content: string, limit = 1_500): string {
 }
 
 export function buildAgentSystemPrompt(agent: AgentRuntimeRecord): string {
+  const memorySummary = getAgentMemorySummary(agent.id);
+  const capabilityPolicy = resolveAgentCapabilityPolicy({
+    toolProfile: agent.toolProfile,
+    allowedCapabilityFamilies: agent.allowedCapabilityFamilies,
+    blockedCapabilityFamilies: agent.blockedCapabilityFamilies,
+  });
   const sections = [
     "You are a dedicated agent managed by Max's control plane.",
     `Agent name: ${agent.name}`,
@@ -59,6 +71,12 @@ export function buildAgentSystemPrompt(agent: AgentRuntimeRecord): string {
     sections.push(
       `Heartbeat automation is configured separately: Max may request the dedicated tick prompt every ${agent.heartbeatIntervalSeconds}s. The cadence is controlled by Max, so never create your own loops, timers, sleeps, or background schedulers.`
     );
+  }
+
+  sections.push(`Capability policy:\n${describeAgentCapabilityPolicy(capabilityPolicy)}`);
+
+  if (memorySummary) {
+    sections.push(`Agent-scoped memory:\n${memorySummary}`);
   }
 
   return sections.join("\n\n");
@@ -152,10 +170,19 @@ function createWorker(agent: AgentRuntimeRecord, session: CopilotSession): Worke
 
 async function resumeOrCreateAgentSession(agent: AgentRuntimeRecord): Promise<CopilotSession> {
   const client = await getClient();
-  const tools = createTools({
+  const capabilityPolicy = resolveAgentCapabilityPolicy({
+    toolProfile: agent.toolProfile,
+    allowedCapabilityFamilies: agent.allowedCapabilityFamilies,
+    blockedCapabilityFamilies: agent.blockedCapabilityFamilies,
+  });
+  const tools = filterBuiltinToolsByPolicy(createTools({
     client,
     workers: getWorkers(),
     onWorkerComplete: () => undefined,
+  }), capabilityPolicy);
+  const externalCapabilities = resolveRuntimeCapabilityAdapters({
+    policy: capabilityPolicy,
+    skills: listSkills(),
   });
   const sessionOptions = {
     model: agent.model ?? config.copilotModel,
@@ -163,8 +190,8 @@ async function resumeOrCreateAgentSession(agent: AgentRuntimeRecord): Promise<Co
     streaming: true,
     systemMessage: { content: buildAgentSystemPrompt(agent) },
     tools,
-    mcpServers: loadMcpConfig(),
-    skillDirectories: getSkillDirectories(),
+    mcpServers: externalCapabilities.mcpServers,
+    skillDirectories: externalCapabilities.skillDirectories,
     onPermissionRequest: approveAll,
     infiniteSessions: {
       enabled: true,

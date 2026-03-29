@@ -1,7 +1,14 @@
 import { z } from "zod";
-import { approveAll, defineTool, type CopilotClient, type CopilotSession, type Tool } from "@github/copilot-sdk";
-import { getDb, addMemory, searchMemories, removeMemory } from "../store/db.js";
-import { readdirSync, readFileSync, statSync } from "fs";
+import { approveAll, defineTool, type CopilotClient, type Tool } from "@github/copilot-sdk";
+import {
+  addMemory,
+  deleteWorkerSession,
+  removeMemory,
+  searchMemories,
+  updateWorkerSessionStatus,
+  upsertWorkerSession,
+} from "../store/db.js";
+import { statSync } from "fs";
 import { join, sep, resolve } from "path";
 import { homedir } from "os";
 import { listSkills, createSkill, removeSkill } from "./skills.js";
@@ -9,6 +16,13 @@ import { config, persistModel } from "../config.js";
 import { SESSIONS_DIR } from "../paths.js";
 import { getCurrentSourceChannel } from "./orchestrator.js";
 import { getRouterConfig, updateRouterConfig } from "./router.js";
+import {
+  attachManagedSession,
+  discoverMachineSessions,
+  findMachineSessionById,
+  formatMachineSessionAge,
+  type WorkerInfo,
+} from "./worker-sessions.js";
 import {
   detectPhase,
   getInitializerPrompt,
@@ -19,6 +33,8 @@ import {
   readProgress,
   type HarnessPhase,
 } from "./harness.js";
+
+export type { WorkerInfo } from "./worker-sessions.js";
 
 function isTimeoutError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
@@ -42,20 +58,6 @@ const BLOCKED_WORKER_DIRS = [
 ];
 
 const MAX_CONCURRENT_WORKERS = 5;
-
-export interface WorkerInfo {
-  name: string;
-  session: CopilotSession;
-  workingDir: string;
-  status: "idle" | "running" | "error";
-  lastOutput?: string;
-  /** Timestamp (ms) when the worker started its current task. */
-  startedAt?: number;
-  /** Channel that created this worker — completions route back here. */
-  originChannel?: "telegram" | "tui";
-  /** True if this worker is part of a harness flow (enables auto-continue). */
-  isHarnessWorker?: boolean;
-}
 
 export interface ToolDeps {
   client: CopilotClient;
@@ -114,15 +116,18 @@ export function createTools(deps: ToolDeps): Tool<any>[] {
           status: "idle",
           originChannel: getCurrentSourceChannel(),
           isHarnessWorker: args.harness === true,
+          sessionSource: "max",
+          copilotSessionId: session.sessionId,
         };
         deps.workers.set(args.name, worker);
 
-        // Persist to SQLite
-        const db = getDb();
-        db.prepare(
-          `INSERT OR REPLACE INTO worker_sessions (name, copilot_session_id, working_dir, status)
-           VALUES (?, ?, ?, 'idle')`
-        ).run(args.name, session.sessionId, args.working_dir);
+        upsertWorkerSession({
+          name: args.name,
+          copilotSessionId: session.sessionId,
+          workingDir: args.working_dir,
+          status: "idle",
+          sessionSource: "max",
+        });
 
         if (args.initial_prompt || args.harness) {
           // Determine the actual prompt to send
@@ -151,9 +156,7 @@ export function createTools(deps: ToolDeps): Tool<any>[] {
 
           worker.status = "running";
           worker.startedAt = Date.now();
-          db.prepare(
-            `UPDATE worker_sessions SET status = 'running', updated_at = CURRENT_TIMESTAMP WHERE name = ?`
-          ).run(args.name);
+          updateWorkerSessionStatus(args.name, "running");
 
           const timeoutMs = config.workerTimeoutMs;
           // Non-blocking: dispatch work and return immediately
@@ -170,7 +173,7 @@ export function createTools(deps: ToolDeps): Tool<any>[] {
             // Auto-destroy background workers after completion to free memory (~400MB per worker)
             session.destroy().catch(() => {});
             deps.workers.delete(args.name);
-            getDb().prepare(`DELETE FROM worker_sessions WHERE name = ?`).run(args.name);
+            deleteWorkerSession(args.name);
           });
 
           return `Worker '${args.name}' created in ${args.working_dir}${phaseLabel}. Task dispatched — I'll notify you when it's done.`;
@@ -199,12 +202,10 @@ export function createTools(deps: ToolDeps): Tool<any>[] {
 
         worker.status = "running";
         worker.startedAt = Date.now();
-        const db = getDb();
-        db.prepare(`UPDATE worker_sessions SET status = 'running', updated_at = CURRENT_TIMESTAMP WHERE name = ?`).run(
-          args.name
-        );
+        updateWorkerSessionStatus(args.name, "running");
 
         const timeoutMs = config.workerTimeoutMs;
+        let finalStatus: WorkerInfo["status"] = "idle";
         // Non-blocking: dispatch work and return immediately
         worker.session.sendAndWait({ prompt: args.prompt }, timeoutMs).then((result) => {
           worker.lastOutput = result?.data?.content || "No response";
@@ -212,12 +213,18 @@ export function createTools(deps: ToolDeps): Tool<any>[] {
         }).catch((err) => {
           const errMsg = formatWorkerError(args.name, worker.startedAt!, timeoutMs, err);
           worker.lastOutput = errMsg;
+          finalStatus = "error";
           deps.onWorkerComplete(args.name, errMsg);
         }).finally(() => {
-          // Auto-destroy after each send_to_worker dispatch to free memory
+          if (worker.sessionSource === "machine") {
+            worker.status = finalStatus;
+            updateWorkerSessionStatus(args.name, finalStatus, worker.lastOutput ?? null);
+            return;
+          }
+
           worker.session.destroy().catch(() => {});
           deps.workers.delete(args.name);
-          getDb().prepare(`DELETE FROM worker_sessions WHERE name = ?`).run(args.name);
+          deleteWorkerSession(args.name);
         });
 
         return `Task dispatched to worker '${args.name}'. I'll notify you when it's done.`;
@@ -272,8 +279,7 @@ export function createTools(deps: ToolDeps): Tool<any>[] {
         }
         deps.workers.delete(args.name);
 
-        const db = getDb();
-        db.prepare(`DELETE FROM worker_sessions WHERE name = ?`).run(args.name);
+        deleteWorkerSession(args.name);
 
         return `Worker '${args.name}' terminated.`;
       },
@@ -290,51 +296,26 @@ export function createTools(deps: ToolDeps): Tool<any>[] {
         limit: z.number().int().min(1).max(100).optional().describe("Max sessions to return (default 20)"),
       }),
       handler: async (args) => {
-        const sessionStateDir = join(homedir(), ".copilot", "session-state");
-        const limit = args.limit || 20;
-
-        let entries: { id: string; cwd: string; summary: string; updatedAt: Date }[] = [];
-
-        try {
-          const dirs = readdirSync(sessionStateDir);
-          for (const dir of dirs) {
-            const yamlPath = join(sessionStateDir, dir, "workspace.yaml");
-            try {
-              const content = readFileSync(yamlPath, "utf-8");
-              const parsed = parseSimpleYaml(content);
-              if (args.cwd_filter && !parsed.cwd?.includes(args.cwd_filter)) continue;
-              entries.push({
-                id: parsed.id || dir,
-                cwd: parsed.cwd || "unknown",
-                summary: parsed.summary || "",
-                updatedAt: parsed.updated_at ? new Date(parsed.updated_at) : new Date(0),
-              });
-            } catch {
-              // Skip dirs without valid workspace.yaml
-            }
-          }
-        } catch (err: unknown) {
-          if (err instanceof Error && "code" in err && (err as NodeJS.ErrnoException).code === "ENOENT") {
-            return "No Copilot sessions found on this machine (session state directory does not exist yet).";
-          }
-          return "Could not read session state directory.";
-        }
-
-        // Sort by most recently updated
-        entries.sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime());
-        entries = entries.slice(0, limit);
-
-        if (entries.length === 0) {
-          return "No Copilot sessions found on this machine.";
-        }
-
-        const lines = entries.map((s) => {
-          const age = formatAge(s.updatedAt);
-          const summary = s.summary ? ` — ${s.summary}` : "";
-          return `• ID: ${s.id}\n  ${s.cwd} (${age})${summary}`;
+        const result = discoverMachineSessions({
+          cwdFilter: args.cwd_filter,
+          limit: args.limit,
         });
 
-        return `Found ${entries.length} session(s) (most recent first):\n${lines.join("\n")}`;
+        if (!result.ok) {
+          return result.message;
+        }
+
+        if (result.sessions.length === 0) {
+          return result.message;
+        }
+
+        const lines = result.sessions.map((session) => {
+          const age = formatMachineSessionAge(session.updatedAt);
+          const summary = session.summary ? ` — ${session.summary}` : "";
+          return `• ID: ${session.id}\n  ${session.workingDir} (${age})${summary}`;
+        });
+
+        return `Found ${result.sessions.length} session(s) (most recent first):\n${lines.join("\n")}`;
       },
     }),
 
@@ -347,32 +328,19 @@ export function createTools(deps: ToolDeps): Tool<any>[] {
         name: z.string().describe("A short name to reference this session by, e.g. 'vscode-main'"),
       }),
       handler: async (args) => {
-        if (deps.workers.has(args.name)) {
-          return `A worker named '${args.name}' already exists. Choose a different name.`;
-        }
-
         try {
-          const session = await deps.client.resumeSession(args.session_id, {
-            model: config.copilotModel,
-            onPermissionRequest: approveAll,
-          });
-
-          const worker: WorkerInfo = {
+          const sessionInfo = findMachineSessionById(args.session_id);
+          await attachManagedSession({
+            client: deps.client,
+            workers: deps.workers,
+            sessionId: args.session_id,
             name: args.name,
-            session,
-            workingDir: "(attached)",
-            status: "idle",
+            workingDir: sessionInfo?.workingDir ?? "(attached)",
             originChannel: getCurrentSourceChannel(),
-          };
-          deps.workers.set(args.name, worker);
-
-          const db = getDb();
-          db.prepare(
-            `INSERT OR REPLACE INTO worker_sessions (name, copilot_session_id, working_dir, status)
-             VALUES (?, ?, '(attached)', 'idle')`
-          ).run(args.name, args.session_id);
-
-          return `Attached to session ${args.session_id.slice(0, 8)}… as worker '${args.name}'. You can now send_to_worker to interact with it.`;
+            sessionSource: "machine",
+          });
+          const location = sessionInfo?.workingDir ?? "(attached)";
+          return `Attached to session ${args.session_id.slice(0, 8)}… as worker '${args.name}' in ${location}. You can now send_to_worker to interact with it.`;
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           return `Failed to attach to session: ${msg}`;
@@ -694,14 +662,18 @@ export function createTools(deps: ToolDeps): Tool<any>[] {
           startedAt: Date.now(),
           originChannel: getCurrentSourceChannel(),
           isHarnessWorker: true,
+          sessionSource: "max",
+          copilotSessionId: session.sessionId,
         };
         deps.workers.set(workerName, worker);
 
-        const db = getDb();
-        db.prepare(
-          `INSERT OR REPLACE INTO worker_sessions (name, copilot_session_id, working_dir, status)
-           VALUES (?, ?, ?, 'running')`
-        ).run(workerName, session.sessionId, args.working_dir);
+        upsertWorkerSession({
+          name: workerName,
+          copilotSessionId: session.sessionId,
+          workingDir: args.working_dir,
+          status: "running",
+          sessionSource: "max",
+        });
 
         const timeoutMs = config.workerTimeoutMs;
         session.sendAndWait({ prompt }, timeoutMs).then((result) => {
@@ -714,7 +686,7 @@ export function createTools(deps: ToolDeps): Tool<any>[] {
         }).finally(() => {
           session.destroy().catch(() => {});
           deps.workers.delete(workerName);
-          getDb().prepare(`DELETE FROM worker_sessions WHERE name = ?`).run(workerName);
+          deleteWorkerSession(workerName);
         });
 
         const status = getHarnessStatus(args.working_dir);
@@ -728,25 +700,4 @@ function renderProgressBar(done: number, total: number): string {
   const width = 20;
   const filled = total > 0 ? Math.round((done / total) * width) : 0;
   return "█".repeat(filled) + "░".repeat(width - filled);
-}
-
-function formatAge(date: Date): string {
-  const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
-  if (seconds < 60) return "just now";
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
-  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
-  return `${Math.floor(seconds / 86400)}d ago`;
-}
-
-function parseSimpleYaml(content: string): Record<string, string> {
-  const result: Record<string, string> = {};
-  for (const line of content.split("\n")) {
-    const idx = line.indexOf(": ");
-    if (idx > 0) {
-      const key = line.slice(0, idx).trim();
-      const value = line.slice(idx + 2).trim();
-      result[key] = value;
-    }
-  }
-  return result;
 }
